@@ -32,7 +32,19 @@ v2.0 的改动：
 
 ## 一、安装
 
-1. 把 `跳过广告-v2.0.apk` 传到手机（数据线 / 微信文件传输 / QQ / LocalSend 都可以）。
+**推荐从 Releases 页面下载：**
+
+### 👉 [点此下载 SkipAd-v2.0.apk](https://github.com/skycommon/skipad-android/releases/latest)
+
+也可以直接用固定地址：
+`https://github.com/skycommon/skipad-android/releases/download/v2.0/SkipAd-v2.0.apk`
+
+> Release 附件名只能是 ASCII，所以下载得到的文件叫 `SkipAd-v2.0.apk`；
+> 与本仓库 `apk/跳过广告-v2.0.apk` 是**同一个文件**（SHA-256 一致）。
+
+安装步骤：
+
+1. 把 APK 传到手机（数据线 / 微信文件传输 / QQ / LocalSend 都可以）。
 2. 在手机上点击该 APK 安装。首次会提示「不允许安装未知应用」，
    按提示在弹出页面里允许**文件管理 / 浏览器 / 传输工具**安装即可。
 3. 桌面会出现蓝色图标「跳过广告」。
@@ -42,6 +54,14 @@ v2.0 的改动：
 
 > 安装时若提示「该应用未经检测」或「存在风险」，这是所有非应用商店 APK 的通用提示，
 > 选择「继续安装」即可。
+
+**校验下载完整性**（可选）：下载后算一次 SHA-256，应与下面一致：
+
+```
+db5b7f092991af790ed25602cd3f8012730f3ef81017696f090ed7d84da8681b
+```
+
+Windows 上：`certutil -hashfile SkipAd-v2.0.apk SHA256`
 
 ## 二、开启（关键一步）
 
