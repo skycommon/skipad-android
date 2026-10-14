@@ -1,21 +1,22 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  无障碍服务配置。
+  无障碍服务配置（v2）。
 
   typeWindowStateChanged / typeWindowContentChanged：应用启动与界面变化时触发扫描。
+  typeWindowsChanged：v2 新增，用于捕捉广告 SDK 新建/销毁的独立窗口。
   flagReportViewIds：必须开启，否则拿不到控件的资源 ID（*:*skip* 这类规则会失效）。
-  flagRetrieveInteractiveWindows：允许获取当前活动窗口。
+  flagRetrieveInteractiveWindows：允许获取全部交互窗口（v2 多窗口扫描的前提）。
   flagIncludeNotImportantViews：部分广告按钮被标为“不重要视图”，不带这个标志会漏掉。
   canRetrieveWindowContent：读取窗口内容，核心能力。
   canPerformGestures：允许 dispatchGesture 做坐标点击（按钮不可点时兜底），必须开启。
   notificationTimeout：事件合并间隔，设小一点响应更快。
 -->
 <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
-    android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged"
+    android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged|typeWindowsChanged"
     android:accessibilityFeedbackType="feedbackGeneric"
     android:accessibilityFlags="flagReportViewIds|flagRetrieveInteractiveWindows|flagIncludeNotImportantViews"
     android:canRetrieveWindowContent="true"
     android:canPerformGestures="true"
     android:description="@string/service_description"
-    android:notificationTimeout="80"
+    android:notificationTimeout="60"
     android:settingsActivity="com.lbx.skipad.MainActivity" />

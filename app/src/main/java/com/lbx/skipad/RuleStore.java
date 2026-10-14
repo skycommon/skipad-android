@@ -29,6 +29,10 @@ final class RuleStore {
     static final String K_VIBRATE = "vibrate";
     static final String K_TOAST = "toast";
     static final String K_LOG = "log_json";
+    /** 诊断快照（跳不掉时抓的窗口树摘要）。 */
+    static final String K_DIAG = "diag_json";
+    /** 是否在跳不掉时自动抓诊断快照。 */
+    static final String K_DIAGNOSE = "diagnose";
 
     private RuleStore() {}
 
@@ -60,6 +64,15 @@ final class RuleStore {
 
     static void setToast(Context c, boolean v) {
         prefs(c).edit().putBoolean(K_TOAST, v).apply();
+    }
+
+    /** 跳不掉时是否自动抓一份窗口树快照（默认开，便于排查）。 */
+    static boolean isDiagnose(Context c) {
+        return prefs(c).getBoolean(K_DIAGNOSE, true);
+    }
+
+    static void setDiagnose(Context c, boolean v) {
+        prefs(c).edit().putBoolean(K_DIAGNOSE, v).apply();
     }
 
     // ------------------------------------------------------------------ 默认规则
@@ -131,6 +144,9 @@ final class RuleStore {
             r.maxWaitMs = clamp(g.optInt("maxWaitMs", 15000), 2000, 120000);
             r.retryLimit = clamp(g.optInt("retryLimit", 5), 1, 50);
             r.continueAfterSkip = g.optBoolean("continueAfterSkip", false);
+            r.blindTapEnabled = g.optBoolean("blindTapEnabled", false);
+            r.blindTapX = clampDouble(g.optDouble("blindTapX", 0.86), 0.0, 1.0);
+            r.blindTapY = clampDouble(g.optDouble("blindTapY", 0.07), 0.0, 1.0);
         }
 
         r.skipTexts = toList(root.optJSONArray("skipTexts"));
@@ -162,6 +178,11 @@ final class RuleStore {
         return v < lo ? lo : (v > hi ? hi : v);
     }
 
+    private static double clampDouble(double v, double lo, double hi) {
+        if (Double.isNaN(v)) return lo;
+        return v < lo ? lo : (v > hi ? hi : v);
+    }
+
     private static List<String> toList(JSONArray arr) {
         List<String> out = new ArrayList<String>();
         if (arr == null) return out;
@@ -189,6 +210,11 @@ final class RuleStore {
         int maxWaitMs = 15000;
         int retryLimit = 5;
         boolean continueAfterSkip = false;
+
+        /** 盲点兜底：完全找不到候选时，按归一化坐标点一次（默认关，有误点风险）。 */
+        boolean blindTapEnabled = false;
+        double blindTapX = 0.86;
+        double blindTapY = 0.07;
 
         List<String> skipTexts = new ArrayList<String>();
         List<String> strongTexts = new ArrayList<String>();

@@ -1,18 +1,44 @@
-# 跳过广告 · Android 版 v1.0
+# 跳过广告 · Android 版 v2.0
 
 一个开屏广告自动跳过工具。只在**你打开某个应用的最初几秒**读取当前界面，
 寻找写着「跳过 / 跳过广告 / Skip」之类的按钮并自动点掉，之后立即停止。
 
 **不联网、不上传、不读取输入框、不修改任何系统设置。**
 
+## v2.0 相对 v1.0 的改动
+
+v1.0 有个根本缺陷：只用 `getRootInActiveWindow()` 扫描**当前活动窗口**。
+而开屏广告经常由广告 SDK 渲染在**独立窗口**里，根本不在活动窗口的节点树内 ——
+所以 QQ音乐 这类 App 的广告永远扫不到。
+
+v2.0 的改动：
+
+| 改动 | 说明 |
+|---|---|
+| **多窗口扫描** | 改用 `getWindows()` 遍历**全部窗口**（这是 QQ音乐 跳不掉的主因） |
+| **候选打分** | 不再「命中第一个就点」，而是收集所有候选后按特征打分，挑最像跳过按钮的 |
+| **剔除广告容器** | 面积超过窗口 55% 的节点不可能是小按钮，直接排除，避免点进广告 |
+| **不再按包名过滤** | 广告窗口常属于广告 SDK 的独立进程，按包名过滤会漏掉 |
+| **放宽重试** | 单次观察最多尝试 8 次（原 5 次），能处理「广告分两段」 |
+| **更多事件类型** | 新增 `typeWindowsChanged`，捕捉广告 SDK 新建/销毁的窗口 |
+| **诊断快照** | 跳不掉时自动记下当前界面所有文字与可点击控件，照着就能配规则 |
+| **盲点兜底** | 可选开关：完全找不到按钮时盲点一次右上角（默认关，有误点风险） |
+
+候选打分权重（见 `SkipEngine.java`）：精确文字 +80、控件 ID +60、强关键词 +40、
+可点击 +25、可点击祖先深度1 +15/深度2 +8、小面积 +20、靠上 +12、靠右 +10、
+靠下 +8、含倒计时数字 +8。**低于 30 分的候选一律不点**。
+
 ---
 
 ## 一、安装
 
-1. 把 `跳过广告-v1.0.apk` 传到手机（数据线 / 微信文件传输 / QQ / LocalSend 都可以）。
+1. 把 `跳过广告-v2.0.apk` 传到手机（数据线 / 微信文件传输 / QQ / LocalSend 都可以）。
 2. 在手机上点击该 APK 安装。首次会提示「不允许安装未知应用」，
    按提示在弹出页面里允许**文件管理 / 浏览器 / 传输工具**安装即可。
 3. 桌面会出现蓝色图标「跳过广告」。
+
+> **从 v1.0 升级**：直接覆盖安装即可（同一个签名密钥，`versionCode` 1→2）。
+> 你的规则设置会保留。
 
 > 安装时若提示「该应用未经检测」或「存在风险」，这是所有非应用商店 APK 的通用提示，
 > 选择「继续安装」即可。
@@ -98,23 +124,26 @@
 {
   "global": {
     "watchAll": true,
-    "scanIntervalMs": 120,
+    "scanIntervalMs": 100,
     "maxTextLen": 8,
     "maxWaitMs": 15000,
-    "retryLimit": 5,
-    "continueAfterSkip": false
+    "retryLimit": 8,
+    "continueAfterSkip": false,
+    "blindTapEnabled": false,
+    "blindTapX": 0.86,
+    "blindTapY": 0.07
   },
-  "skipTexts":   ["跳过", "跳过广告", "Skip"],
-  "strongTexts": ["跳过", "关闭广告"],
-  "denyTexts":   ["跳过此步骤", "跳过引导", "跳过教程", "取消"],
-  "skipIds":     ["*:*skip*", "*:*close_ad*"],
+  "skipTexts":   ["跳过", "跳过广告", "跳过此广告", "关闭广告", "Skip"],
+  "strongTexts": ["跳过", "关闭广告", "skip"],
+  "denyTexts":   ["跳过此步骤", "跳过引导", "跳过教程", "跳过学习", "取消"],
+  "skipIds":     ["*:*skip*", "*:*close_ad*", "*:*ad_close*"],
   "excludeApps": ["com.android.settings", "com.miui.home"],
   "apps": {
-    "com.example.app": {
-      "name": "某应用",
+    "com.tencent.qqmusic": {
+      "name": "QQ音乐",
       "enabled": true,
-      "extraTexts": ["关闭广告"],
-      "extraIds": ["btn_close_ad"]
+      "extraTexts": ["跳过", "关闭广告"],
+      "extraIds": ["*:*skip*", "*:*splash*"]
     }
   }
 }
@@ -125,17 +154,28 @@
 | 字段 | 作用 |
 |---|---|
 | `watchAll` | 是否监听所有应用。`false` 时只监听 `apps` 里列出的、且 `enabled` 为 true 的应用 |
-| `scanIntervalMs` | 扫描间隔（毫秒），范围 40–2000。越小响应越快、越耗电，默认 120 |
+| `scanIntervalMs` | 扫描间隔（毫秒），范围 40–2000。越小响应越快、越耗电，默认 100 |
 | `maxTextLen` | 关键词包含匹配的长度上限，范围 2–20。**调大更容易命中，但也更容易误伤**，默认 8 |
 | `maxWaitMs` | 观察窗口时长（毫秒），范围 2000–120000。超过就停止扫描，默认 15000 |
-| `retryLimit` | 一次启动内最多尝试点击几次，范围 1–50，默认 5 |
+| `retryLimit` | 一次启动内最多尝试点击几次，范围 1–50，默认 8（v2 调大，能处理「广告分两段」） |
 | `continueAfterSkip` | 跳过一次后是否继续找下一个跳过后，默认 `false` |
-| `skipTexts` | **精确匹配**：控件文字去掉空白和标点后与此完全相同才命中 |
-| `strongTexts` | **包含匹配**：文字压缩后长度 ≤ `maxTextLen` 且包含此关键词即命中 |
+| `blindTapEnabled` | **盲点兜底**：完全找不到任何候选时，按下面的坐标盲点一次。默认 `false` |
+| `blindTapX` / `blindTapY` | 盲点位置的**归一化坐标**（0~1，相对屏幕）。默认 `0.86, 0.07` 即右上角 |
+| `skipTexts` | **精确匹配**：控件文字去掉空白和标点后与此完全相同才命中，+80 分 |
+| `strongTexts` | **包含匹配**：文字压缩后长度 ≤ `maxTextLen` 且包含此关键词即命中，+40 分 |
 | `denyTexts` | 黑名单。完全相等，或黑名单词 ≥3 字且被包含时，**一律不点** |
-| `skipIds` | 控件 ID 规则，见下 |
+| `skipIds` | 控件 ID 规则，见下，+60 分 |
 | `excludeApps` | 永不监听的应用（桌面、设置、安装器、系统 UI 等） |
 | `apps` | 针对单个应用的覆写：`enabled` 是否监听、`extraTexts`/`extraIds` 追加规则 |
+
+### 关于「盲点兜底」
+
+默认关闭，因为**盲点有误点风险**（它不看界面内容，纯粹按坐标点一下右上角）。
+什么时候值得开：某个 App 明明有开屏广告、日志和诊断快照里却**完全找不到任何按钮**
+（广告是纯图片/视频、按钮用自绘控件），这时盲点是唯一手段。
+
+开了之后如果发现误点，把 `blindTapX`/`blindTapY` 调到真正跳过按钮的位置即可
+（用「查看诊断」看界面尺寸，再算归一化坐标）。
 
 ### 控件 ID 的三种写法
 
@@ -149,14 +189,25 @@ Android 的控件 ID 长这样：`com.tencent.mm:id/skip_btn`，冒号后面是 
 
 通配符 `*` 表示任意长度字符（含空）。
 
-### 某个 App 跳不掉怎么办
+### 某个 App 跳不掉怎么办（v2 推荐流程）
 
-1. 先开 **查看日志**：如果压根没有记录，说明没找到按钮 —— 进第 2 步；
-   如果有记录但广告还在，说明点错了位置 —— 见第 4 步。
-2. 把 `maxTextLen` 临时调到 **10~12**，多半就能覆盖。
-3. 仍然不行，就把该 App 的跳过按钮文字加到 `skipTexts`（精确匹配最安全）。
-   例如按钮是「跳过 3」，就加 `"跳过 3"`。
-4. 如果是误点（点进了广告），把误点的文字加进 `denyTexts`。
+**第 0 步：先看「查看诊断」。** 这是 v2 最有力的工具。
+保持「抓取诊断快照」开启，然后打开那个跳不掉广告的 App，
+等广告自己结束后回到本应用点「查看诊断」。里面会列出该界面**所有文字和可点击控件**，
+包括按钮的真实文案和控件 ID。照着配规则，一次就能配准。
+
+然后按日志分情况处理：
+
+1. **日志里压根没记录** → 说明没找到按钮。
+   - 打开诊断快照，找找有没有像「跳过」的按钮，把它的文字加到 `skipTexts`；
+   - 顺带把 `maxTextLen` 临时调到 **10~12**；
+   - 如果诊断里**连一个按钮都没有**（纯图片广告），才考虑开「盲点兜底」。
+2. **有记录但广告还在** → 说明点错了位置。
+   - 把被误点的文字加进 `denyTexts`；
+   - 或把 `maxTextLen` 调小；
+   - 极端情况下把该应用加进 `excludeApps`。
+3. **点进了广告（跳转到广告页）** → 把 `denyTexts` 补上误点文字，
+   并把该应用加进 `excludeApps` 先停掉，避免反复误触。
 
 ### 误伤了正常按钮怎么办
 
@@ -174,21 +225,28 @@ Android 的控件 ID 长这样：`com.tencent.mm:id/skip_btn`，冒号后面是 
       ↓
 判断是否在监听范围（不在 excludeApps、且 watchAll 或已单独配置）
       ↓  是
-开启观察窗口（默认 15 秒），窗口内监听窗口内容变化
+开启观察窗口（默认 15 秒），窗口内监听内容变化与窗口增删
       ↓
-遍历窗口控件树，逐个比对：
-      · 控件 ID 命中 skipIds？
-      · 文字去掉空白标点后与 skipTexts 完全相同？
-      · 文字很短（≤ maxTextLen）且包含 strongTexts 关键词？
+【v2 核心】用 getWindows() 遍历**全部窗口**的控件树，
+逐个比对：
+      · 控件 ID 命中 skipIds？              → +60
+      · 文字去掉空白标点后与 skipTexts 完全相同？ → +80
+      · 文字很短（≤ maxTextLen）且含 strongTexts？ → +40
       · 命中 denyTexts 黑名单？→ 直接放弃
-      · 是输入框 / WebView？→ 直接放弃
-      ↓  命中
+      · 是输入框？→ 直接放弃
+      · 面积超过窗口 55%？→ 直接放弃（是广告容器，不是小按钮）
+      ↓
+对全部候选打分（可点击 +25、小面积 +20、靠上 +12、靠右 +10、
+含倒计时 +8、可点击祖先越近分越高），取最高分者
+      ↓  最高分 ≥ 30
 点击：先试控件自身的点击事件，再试它所在坐标的模拟点击，
       最后才向上找可点击的父控件（顺序刻意如此，避免点进广告）
       ↓
-震动 + 提示 + 记一条日志，结束本次观察
+震动 + 提示 + 记一条日志
+      ↓  从未命中且开启了盲点
+按 blindTapX/Y 归一化坐标盲点一次（默认关）
       ↓  超时 15 秒仍没找到
-静默退出，本次不再扫描
+静默退出，若开了诊断则存一份界面快照
 ```
 
 ### 为什么这样设计
@@ -196,11 +254,21 @@ Android 的控件 ID 长这样：`com.tencent.mm:id/skip_btn`，冒号后面是 
 **只在启动窗口内工作。** 开屏广告只可能出现在应用启动的最初几秒。
 过了这个窗口就完全停止扫描，所以不会在你正常刷微信、看视频时误点。
 
+**扫全部窗口，而不只是活动窗口。** 这是 v2 最重要的修正。
+开屏广告经常由广告 SDK 渲染在独立窗口里，`getRootInActiveWindow()`
+根本看不到它 —— v1 在 QQ音乐 上失效就是这个原因。
+
 **长度限制（`maxTextLen`）。** 「点击跳过，查看更多精彩内容」这种长句里也含「跳过」，
 但它显然不是跳过按钮。压缩后超过 8 个字就一律不做包含匹配，从源头掐掉大部分误伤。
 
 **黑名单机制。** 「跳过此步骤」「跳过引导」「跳过教程」这类按钮点下去会真的跳过流程，
 所以宁可漏点也不点。
+
+**候选打分而不是先到先得。** 一个开屏页里同时出现「跳过」「立即查看」「5s」很常见，
+按分数挑最像按钮的那个（精确文字 + 位置 + 大小 + 可点击性），比"第一个命中就点"稳得多。
+
+**剔除大块容器。** 面积占窗口 55% 以上的节点只可能是广告容器本身。
+点它就会跳转到广告落地页，所以从候选里直接排除。
 
 **点击顺序。** 很多开屏页整个广告区域都是可点击的（点了就跳广告落地页），
 而「跳过」文字只是它的子节点。如果一上来就找可点击的父控件，很可能点到广告本身，
@@ -209,8 +277,8 @@ Android 的控件 ID 长这样：`com.tencent.mm:id/skip_btn`，冒号后面是 
 ## 六、隐私
 
 - 没有任何网络权限，**Manifest 里连 INTERNET 都没申请**，物理上不可能联网。
-- 只读取无障碍服务当前所在窗口的控件树，不读取其他应用的数据。
-- 跳过记录只存在手机本地，随时可清空。
+- 只读取无障碍服务可见窗口的控件树，不读取其他应用的数据。
+- 跳过记录与诊断快照只存在手机本地，随时可清空。
 - 唯一申请的权限是 `VIBRATE`（震动）。
 
 可以在应用设置里查看：本 APK 申请的权限只有 1 项 —— `android.permission.VIBRATE`。
@@ -228,8 +296,15 @@ A：见第二节「列表里找不到「跳过广告」怎么办」。
 应用首页已经为这两种情况各放了一个快捷按钮。
 
 **Q：显示已启用，但某些 App 还是跳不掉？**
-A：说明这些 App 的跳过按钮文字或结构特殊。按第四节「某个 App 跳不掉怎么办」逐步排查，
-把 `maxTextLen` 调大通常能解决大部分情况。
+A：v2 给了专门的排查工具。按这个顺序来：
+
+1. 保持「抓取诊断快照」开启，重现一次那个 App 的开屏；
+2. 回到本应用点「查看诊断」，看那张界面上到底有哪些文字和按钮；
+3. 把真正的跳过按钮文字加进 `skipTexts`；
+4. 如果诊断里**一个按钮都没有**（纯图片/视频广告），才考虑开「盲点兜底」。
+
+**Q：升级到 v2.0 要卸载重装吗？**
+A：不用。同一个签名密钥，直接覆盖安装，规则设置会保留。
 
 **Q：会不会把我微信聊天里的内容传出去？**
 A：不会。没有网络权限，代码里也没有任何网络调用。
@@ -270,6 +345,7 @@ Number of signers: 1
 >
 > 重新编译时密钥库会自动生成在 工程根目录的 `keystore/skipad.jks`（口令 `skipad123`）。
 > **升级已安装的应用必须用同一个密钥库**，否则系统会拒绝覆盖安装。
+> v1.0 → v2.0 用的是同一个密钥库，所以可以直接覆盖升级。
 
 ## 九、源码与重新编译
 
@@ -278,7 +354,7 @@ Number of signers: 1
 
 ```powershell
 pwsh -File build.ps1     # 编译出 APK
-pwsh -File test.ps1      # 跑 114 项逻辑自测
+pwsh -File test.ps1      # 跑 153 项逻辑自测
 ```
 
 构建流程：
@@ -300,7 +376,7 @@ aapt2 compile（编译资源）
 ### 路径含中文时的处理（已经自动搞定）
 
 `aapt2` 在 Windows 上有个已知缺陷：**无法打开路径里含非 ASCII 字符的文件**。
-把本工程放在 `D:\手机跳广告（安卓版）\源码` 这类含中文的路径下时，直接调用会报：
+把本工程放在 `D:\手机跳广告（安卓版）\源码` 这类路径下时，直接调用会报：
 
 ```
 aapt2 compile --dir <带中文的路径>
@@ -324,17 +400,16 @@ aapt2 不支持非 ASCII 路径，本次构建将在临时目录中进行：
 ### 源码结构
 
 ```
-.
+
   README.md                                本说明
-  先看这里.txt                              给「只想装 APK」的人看的三分钟上手
-  apk/跳过广告-v1.0.apk                     已签名的成品，可直接安装
+  apk/跳过广告-v2.0.apk                     已签名成品，可直接安装
   app/
     build.gradle                           模块配置（无第三方依赖）
     src/main/AndroidManifest.xml
     src/main/java/com/lbx/skipad/
-        MainActivity.java                  主界面：开关、规则编辑、日志
-        SkipAccessibilityService.java      无障碍服务：观察窗口、事件调度、点击与记录
-        SkipEngine.java                    核心算法：文字归一化、匹配、遍历控件树、点击
+        MainActivity.java                  主界面：开关、规则编辑、日志、诊断查看
+        SkipAccessibilityService.java      无障碍服务：多窗口调度、诊断抓取、点击与记录
+        SkipEngine.java                    核心算法：归一化、匹配、候选打分、遍历多窗口、点击
         RuleStore.java                     规则读写与 JSON 解析
     src/main/res/
         raw/default_rules.json             默认规则
@@ -342,16 +417,17 @@ aapt2 不支持非 ASCII 路径，本次构建将在临时目录中进行：
         xml/accessibility_service_config.xml
         mipmap-*/ic_launcher*.png          应用图标（5 种密度）
         drawable/, mipmap-anydpi-v26/
-    src/test/java/com/lbx/skipad/EngineTest.java   114 项纯逻辑单元测试
+    src/test/java/com/lbx/skipad/EngineTest.java   153 项纯逻辑单元测试
   build.gradle / settings.gradle / gradle.properties   Android Studio 工程配置
   build.ps1                                免 Gradle 构建脚本（路径自动推导，可整个搬走，含中文路径）
   test.ps1                                 免设备单元测试脚本
   gen_icon.py                              图标生成（Pillow）
   get_json.ps1                             下载单测用的 org.json 实现
-  tools/                                   随仓库附带的官方工具链（约 100 MB）
-      jdk/                                 OpenJDK 17 最小运行时（jlink 裁剪，含 javac / keytool / java）
-      build-tools/                         aapt2 / aapt / d8 / zipalign / apksigner
+  tools/                                   随包附带的官方工具链
+      jdk/                                 OpenJDK 17（含 javac / keytool）
+      build-tools/                         aapt2 / d8 / zipalign / apksigner / aapt
       platform/                            android.jar（API 34）
+      platform-tools/                      adb（可选，用于连手机调试）
       lib/                                 单测用的 json-20231013.jar
 ```
 
@@ -361,61 +437,28 @@ aapt2 不支持非 ASCII 路径，本次构建将在临时目录中进行：
 （OpenJDK 来自华为云镜像，Android SDK 来自腾讯云镜像，均为原始未修改文件），
 这样在没有 Android Studio、没有 Gradle 的环境里也能一键重编。
 
-为了让仓库能放进 GitHub（单文件上限 100 MB），做了这些无损裁剪：
-
-- **JDK**：用 `jlink` 生成只含编译所需模块的最小运行时（`java.base` + `jdk.compiler` 等），
-  保留 `javac` / `keytool` / `java`，从 294 MB 压到 52 MB；
-- **build-tools**：删掉只服务 NDK 与 RenderScript 的
-  `libLLVM_android.dll` / `libclang_android.dll` / `llvm-rs-cc.exe` / `renderscript/`，
-  从 137 MB 压到 29 MB；
-- **platform**：只保留 `android.jar`，删掉 `data/` `skins/` `templates/`。
-
-裁剪后仓库约 100 MB，`aapt2` / `d8` / `zipalign` / `apksigner` 功能完全不受影响
-（`build.ps1` 与 `test.ps1` 均已在裁剪后的工具链上验证通过）。
-
 **如果你只需要装 APK，不需要重新编译，可以把 `tools/` 整个删掉**，能省下约 100 MB。
-
-如果你想要完整未裁剪的官方工具链（或换 JDK/SDK 版本），下载地址：
-
-```
-OpenJDK 17 : https://mirrors.huaweicloud.com/openjdk/17.0.2/openjdk-17.0.2_windows-x64_bin.zip
-Android SDK: https://mirrors.cloud.tencent.com/AndroidSDK/
-             ↳ build-tools_r34-windows.zip
-             ↳ platform-34-ext7_r03.zip
-             ↳ platform-tools_r37.0.1-win.zip
-```
-
-解压到 `tools/` 下对应位置即可，`build.ps1` 会自动识别目录名里的版本号。
-
-### 关于签名密钥
-
-**本仓库不含签名密钥库**（`keystore/` 已在 `.gitignore` 中排除），因为私钥不应公开。
-
-这不影响编译：`build.ps1` 发现密钥库缺失时会自动生成一份新的，
-只是新密钥的签名指纹与本仓库 `apk/` 里那份成品不同。
-这两种包**不能互相覆盖安装**（Android 要求签名一致才能升级），需要先卸载再装。
-
-`apk/跳过广告-v1.0.apk` 的签名指纹：
-
-```
-证书主题  : CN=SkipAd, OU=Personal, O=LBX, L=CN, ST=CN, C=CN
-SHA-256  : 75:34:24:6A:3B:BF:DF:90:87:25:75:67:3B:05:DF:F9:68:92:E5:22:3C:04:0E:C4:FD:65:19:D6:DD:B6:C2:93
-SHA-1    : 55:C3:5C:95:B6:28:38:3B:CF:DC:3C:7B:2C:9E:E8:79:C0:95:AE:85
-```
 
 ### 自测覆盖
 
-`test.ps1` 会在桌面 JVM 上运行 114 项断言，不需要手机、不需要模拟器：
+`test.ps1` 会在桌面 JVM 上运行 153 项断言，不需要手机、不需要模拟器：
 
-- 规则 JSON 解析与边界钳制（`scanIntervalMs` 下限 40、`maxTextLen` 上限 20 等）
-- 文本归一化（去空白、去标点、大小写、全角空格）
+- 规则 JSON 解析与边界钳制（`scanIntervalMs` 下限 40、`maxTextLen` 上限 20、
+  `blindTapX/Y` 钳到 0~1 等）
+- 文本归一化（去空白、去标点、大小写、全角空格、是否有数字）
 - 正向命中：13 种真实跳过按钮写法（「跳过5」「5s 跳过」「跳过|5」「Skip Ad」…）
 - 反向拒绝：27 个常见正常按钮（「同意并继续」「一键登录」「以后再说」…）零误伤
 - 黑名单拦截：「跳过此步骤」「跳过引导」「跳过学习」等
 - 控件 ID 通配匹配（`*:*skip*`、全限定写法、`glob` 边界）
+- **v2 候选打分**：单项权重、位置加成（右上 > 正中）、小面积加成、
+  可点击祖先深度优劣、倒计时加成、大容器低于阈值、`pickBest` 选优与全差返回 null
+- **v2 matchKind**：精确=2 / 包含=1 / 不匹配=0 / 黑名单=0
 - 监听范围判定（桌面、设置、安装器不监听）
 - 逐应用覆写、非法 JSON 容错、null 入参不崩
 
+打分逻辑之所以能在桌面 JVM 上测，是因为 `Cand` 的打分只依赖纯数据字段
+（`idHit`/`exactHit`/`areaRatio`/`nx`/`ny` 等），不碰 `AccessibilityNodeInfo`。
+
 ---
 
-版本 1.0 · 最低支持 Android 7.0（API 24）· 目标 Android 14（API 34）· 体积 98 KB
+版本 2.0 · 最低支持 Android 7.0（API 24）· 目标 Android 14（API 34）· 体积 106 KB

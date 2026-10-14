@@ -93,7 +93,7 @@ public class MainActivity extends android.app.Activity {
         root.addView(t);
 
         TextView s = new TextView(this);
-        s.setText("开屏广告自动跳过 · 本地运行 · 不联网");
+        s.setText("v2.0 · 多窗口扫描 · 本地运行 · 不联网");
         s.setTextSize(13);
         s.setTextColor(C_SUB);
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
@@ -200,6 +200,27 @@ public class MainActivity extends android.app.Activity {
                     }
                 }));
 
+        card.addView(divider());
+
+        card.addView(switchRow("抓取诊断快照", "跳不掉时记下当前界面文字，便于排查",
+                RuleStore.isDiagnose(this), new OnChecked() {
+                    @Override
+                    public void onChecked(boolean v) {
+                        RuleStore.setDiagnose(MainActivity.this, v);
+                    }
+                }));
+
+        card.addView(divider());
+
+        card.addView(switchRow("盲点兜底", "完全找不到按钮时，盲点右上角一次。可能误点，谨慎开启",
+                isBlindTap(), new OnChecked() {
+                    @Override
+                    public void onChecked(boolean v) {
+                        setGlobalBool("blindTapEnabled", v);
+                        refreshStatus();
+                    }
+                }));
+
         root.addView(card);
     }
 
@@ -233,13 +254,22 @@ public class MainActivity extends android.app.Activity {
         card.addView(row1);
 
         LinearLayout row2 = buttonRow();
+        row2.addView(secondaryButton("查看诊断", new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                showDiagnostics();
+            }
+        }));
         row2.addView(secondaryButton("恢复默认规则", new View.OnClickListener() {
             @Override
             public void onClick(View v) {
                 confirmReset();
             }
         }));
-        row2.addView(secondaryButton("清空日志", new View.OnClickListener() {
+        card.addView(row2);
+
+        LinearLayout row3 = buttonRow();
+        row3.addView(secondaryButton("清空日志", new View.OnClickListener() {
             @Override
             public void onClick(View v) {
                 RuleStore.prefs(MainActivity.this).edit()
@@ -247,7 +277,15 @@ public class MainActivity extends android.app.Activity {
                 toast("日志已清空");
             }
         }));
-        card.addView(row2);
+        row3.addView(secondaryButton("清空诊断", new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                RuleStore.prefs(MainActivity.this).edit()
+                        .putString(RuleStore.K_DIAG, "[]").apply();
+                toast("诊断记录已清空");
+            }
+        }));
+        card.addView(row3);
 
         root.addView(card);
     }
@@ -300,6 +338,7 @@ public class MainActivity extends android.app.Activity {
             sb.append("关键词：").append(join(r.strongTexts)).append('\n');
             sb.append("控件 ID：").append(r.skipIds.size()).append(" 条\n");
             sb.append("排除应用：").append(r.excludeApps.size()).append(" 个\n");
+            sb.append("单独配置：").append(r.apps.size()).append(" 个\n");
             sb.append("观察窗口：").append(r.maxWaitMs / 1000).append(" 秒 · 扫描间隔 ")
                     .append(r.scanIntervalMs).append(" 毫秒");
             ruleSummary.setText(sb.toString());
@@ -475,6 +514,51 @@ public class MainActivity extends android.app.Activity {
                 .show();
     }
 
+    /**
+     * 显示诊断快照：某个 App 跳不掉时，这里能看到它开屏界面的
+     * 全部文字与可点击控件，照着把真正的按钮文字加进规则即可。
+     */
+    private void showDiagnostics() {
+        String raw = RuleStore.prefs(this).getString(RuleStore.K_DIAG, null);
+        StringBuilder sb = new StringBuilder();
+        try {
+            if (!TextUtils.isEmpty(raw)) {
+                JSONArray arr = new JSONArray(raw);
+                for (int i = 0; i < arr.length(); i++) {
+                    String s = arr.optString(i, null);
+                    if (s == null || s.isEmpty()) continue;
+                    sb.append("========== 快照 ").append(i + 1).append(" ==========\n");
+                    sb.append(s).append('\n');
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        if (sb.length() == 0) {
+            sb.append("暂无诊断记录。\n\n")
+              .append("用法：保持「抓取诊断快照」开启，然后正常打开某个跳不掉广告的 App，")
+              .append("等广告自己结束后，回来点这个按钮。\n\n")
+              .append("这里会列出该界面上所有文字和可点击控件，")
+              .append("你可以照着把真正的「跳过」按钮文字填进「编辑规则」的 skipTexts 里。");
+        }
+
+        TextView tv = new TextView(this);
+        tv.setText(sb.toString());
+        tv.setTextSize(12);
+        tv.setTypeface(Typeface.MONOSPACE);
+        tv.setTextColor(C_TEXT);
+        tv.setTextIsSelectable(true);
+        tv.setPadding(dp(16), dp(12), dp(16), dp(12));
+
+        ScrollView sc = new ScrollView(this);
+        sc.addView(tv);
+
+        new AlertDialog.Builder(this)
+                .setTitle("诊断快照（可长按复制）")
+                .setView(sc)
+                .setPositiveButton("关闭", null)
+                .show();
+    }
+
     // ------------------------------------------------------------------ 规则内联写
 
     private boolean isWatchAll() {
@@ -484,6 +568,16 @@ public class MainActivity extends android.app.Activity {
             return g == null || g.optBoolean("watchAll", true);
         } catch (Throwable t) {
             return true;
+        }
+    }
+
+    private boolean isBlindTap() {
+        try {
+            JSONObject root = new JSONObject(RuleStore.getRawJson(this));
+            JSONObject g = root.optJSONObject("global");
+            return g != null && g.optBoolean("blindTapEnabled", false);
+        } catch (Throwable t) {
+            return false;
         }
     }
 

@@ -1,20 +1,28 @@
 {
+  "_说明": "改完点保存即可生效。字段含义见应用内 README 或仓库 README.md 第四节。",
+
   "global": {
     "watchAll": true,
-    "scanIntervalMs": 120,
+    "scanIntervalMs": 100,
     "maxTextLen": 8,
     "maxWaitMs": 15000,
-    "retryLimit": 5,
-    "continueAfterSkip": false
+    "retryLimit": 8,
+    "continueAfterSkip": false,
+    "blindTapEnabled": false,
+    "blindTapX": 0.86,
+    "blindTapY": 0.07
   },
 
   "skipTexts": [
     "跳过",
     "跳过广告",
-    "关闭广告",
     "跳过此广告",
+    "关闭广告",
+    "关闭此广告",
     "点击跳过",
     "跳过 >",
+    "跳过>>",
+    "跳过广告 >",
     "Skip",
     "Skip Ad",
     "Skip Ads",
@@ -24,7 +32,9 @@
   "strongTexts": [
     "跳过",
     "关闭广告",
-    "跳过广告"
+    "跳过广告",
+    "skipad",
+    "skip"
   ],
 
   "denyTexts": [
@@ -35,6 +45,7 @@
     "跳过学习",
     "跳过验证",
     "跳过登录",
+    "跳过新手",
     "暂不跳过",
     "取消"
   ],
@@ -43,7 +54,10 @@
     "*:*skip*",
     "*:*close_ad*",
     "*:*closead*",
-    "*:*ad_close*"
+    "*:*ad_close*",
+    "*:*close_ads*",
+    "*:*ad_skip*",
+    "*:*skip_ad*"
   ],
 
   "excludeApps": [
@@ -64,5 +78,21 @@
     "com.lbx.skipad"
   ],
 
-  "apps": {}
+  "apps": {
+    "com.tencent.qqmusic": {
+      "name": "QQ音乐",
+      "enabled": true,
+      "extraTexts": [
+        "跳过",
+        "关闭广告",
+        "跳过广告"
+      ],
+      "extraIds": [
+        "*:*skip*",
+        "*:*splash*",
+        "*:*ad*close*",
+        "*:*close*ad*"
+      ]
+    }
+  }
 }

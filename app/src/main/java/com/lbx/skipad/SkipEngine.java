@@ -11,29 +11,96 @@ import java.util.List;
 import java.util.Locale;
 
 /**
- * 核心识别与点击逻辑。
+ * 核心识别与点击逻辑（v2）。
  *
- * 设计原则：宁可不点，不可错点。
- *  - 只在“应用刚启动的前若干秒”这个时间窗内工作（开屏广告只会出现在这个窗口）；
- *  - 文字必须短且能压缩成已知关键词，否则不点；
- *  - 命中黑名单文字不点；
- *  - 输入框内不点。
+ * v1 只用 getRootInActiveWindow() 扫当前活动窗口，这是 QQ音乐 这类 App
+ * 跳不掉的主要原因：开屏广告常常由广告 SDK 渲染在**独立的窗口**里，
+ * 它不在活动窗口的节点树内，所以永远扫不到。
+ * v2 改为遍历 getWindows() 的全部窗口。
+ *
+ * 其它改进：
+ *  - 候选打分：不再「命中第一个就点」，而是收集多个候选后挑最像跳过按钮的那个；
+ *  - 剔除大块广告容器：面积超过屏幕 55% 的节点不可能是「跳过」小按钮；
+ *  - 更全面的默认控件 ID / 文案（见 default_rules.json）。
+ *
+ * 设计原则不变：宁可不点，不可错点。
  */
 final class SkipEngine {
 
     private SkipEngine() {}
 
-    private static final int MAX_NODES = 800;
-    /** 从命中节点向上最多回溯多少层找可点击祖先。 */
+    /** 单次扫描最多看的节点数（所有窗口加起来）。 */
+    private static final int MAX_NODES = 2000;
+    /** 从命中节点向上最多回溯多少层找可点击祖先（真正点击时）。 */
     private static final int MAX_ANCESTOR_UP = 8;
+    /** 打分时向上探查可点击祖先的层数（比点击时浅，够判断即可）。 */
+    private static final int CLICK_PROBE_UP = 3;
+    /** 面积超过屏幕这个比例的节点视为广告容器，不做候选。 */
+    private static final double MAX_AREA_RATIO = 0.55;
 
-    static final class Hit {
-        final AccessibilityNodeInfo node;
-        final String reason;
+    // ------------------------------------------------------------------ 打分权重
+    // 全部是纯常量，配合 Cand 里的纯数据字段，可以在桌面 JVM 上直接单测。
 
-        Hit(AccessibilityNodeInfo node, String reason) {
-            this.node = node;
-            this.reason = reason;
+    static final int S_ID        = 60;
+    static final int S_EXACT     = 80;
+    static final int S_STRONG    = 40;
+    static final int S_CLICKABLE = 25;
+    static final int S_ANC_1     = 15;
+    static final int S_ANC_2     = 8;
+    static final int S_SMALL     = 20;
+    static final int S_TOP       = 12;
+    static final int S_RIGHT     = 10;
+    static final int S_BOTTOM    = 8;
+    static final int S_COUNTDOWN = 8;
+
+    /** 低于这个分数的候选直接放弃，避免"矮子里拔将军"点错。 */
+    static final int MIN_SCORE = 30;
+
+    // ------------------------------------------------------------------ 候选
+
+    /**
+     * 一个候选跳过按钮。
+     * 除 node 外的字段都是纯数据，便于脱离安卓环境单测打分逻辑。
+     */
+    static final class Cand {
+        AccessibilityNodeInfo node;
+        String reason = "";
+
+        boolean idHit;
+        boolean exactHit;
+        boolean strongHit;
+        boolean clickable;
+        /** 向上几层能找到可点击祖先；-1 表示 {@link #CLICK_PROBE_UP} 层内没有。 */
+        int clickableDepth = -1;
+        /** 占窗口面积比例 0~1。 */
+        double areaRatio;
+        /** 归一化中心点，0~1。 */
+        double nx = 0.5;
+        double ny = 0.5;
+        /** 是否含数字（倒计时，如"跳过5"）。 */
+        boolean hasDigit;
+
+        /** 综合打分。纯函数，不碰 node。 */
+        int score() {
+            int s = 0;
+            if (idHit) s += S_ID;
+            if (exactHit) s += S_EXACT;
+            if (strongHit) s += S_STRONG;
+            if (clickable) s += S_CLICKABLE;
+            if (clickableDepth == 1) s += S_ANC_1;
+            else if (clickableDepth == 2) s += S_ANC_2;
+
+            // 按钮通常不大：面积占比越小越像按钮
+            if (areaRatio > 0 && areaRatio <= 0.06) s += S_SMALL;
+            else if (areaRatio > 0 && areaRatio <= 0.15) s += S_SMALL / 2;
+
+            // 常见位置：右上角、右上偏下、底部
+            if (ny <= 0.18) s += S_TOP;
+            if (nx >= 0.62) s += S_RIGHT;
+            if (ny >= 0.80) s += S_BOTTOM;
+
+            if (hasDigit) s += S_COUNTDOWN;
+            return s;
         }
     }
 
@@ -50,7 +117,6 @@ final class SkipEngine {
             char c = s.charAt(i);
             if (Character.isWhitespace(c)) continue;
             if (Character.isLetterOrDigit(c)) sb.append(c);
-            // 其它（标点、Emoji、符号）一律丢掉
         }
         return sb.toString().toLowerCase(Locale.ROOT);
     }
@@ -60,36 +126,49 @@ final class SkipEngine {
         return cs.toString().replace('\u00A0', ' ').trim();
     }
 
+    static boolean hasDigit(String s) {
+        if (s == null) return false;
+        for (int i = 0; i < s.length(); i++) {
+            if (Character.isDigit(s.charAt(i))) return true;
+        }
+        return false;
+    }
+
     // ------------------------------------------------------------------ 匹配
 
-    static boolean textMatches(String raw, RuleStore.Rules r, List<String> texts, List<String> strong) {
-        if (raw == null || raw.isEmpty()) return false;
-        String compact = compact(raw);
-        if (compact.isEmpty()) return false;
+    /** 0=不匹配，1=强关键词包含，2=精确匹配。 */
+    static int matchKind(String raw, RuleStore.Rules r, List<String> texts, List<String> strong) {
+        if (raw == null || raw.isEmpty()) return 0;
+        String c = compact(raw);
+        if (c.isEmpty()) return 0;
 
         // 1) 黑名单优先：完全相等，或黑名单词较长且被包含
-        //    （例："跳过此步骤" 能拦住 "跳过此步骤详情"，而短词如"取消"只做完全匹配，避免误伤）
         for (String d : r.denyTexts) {
             String dc = compact(d);
             if (dc.isEmpty()) continue;
-            if (compact.equals(dc)) return false;
-            if (dc.length() >= 3 && compact.contains(dc)) return false;
+            if (c.equals(dc)) return 0;
+            if (dc.length() >= 3 && c.contains(dc)) return 0;
         }
 
-        // 2) 精确匹配（用户配置的完整文字，忽略大小写/空白/标点）
+        // 2) 精确匹配
         for (String s : texts) {
             String sc = compact(s);
-            if (!sc.isEmpty() && compact.equals(sc)) return true;
+            if (!sc.isEmpty() && c.equals(sc)) return 2;
         }
 
         // 3) 强关键词包含匹配：仅当压缩后足够短
-        if (compact.length() <= r.maxTextLen) {
+        if (c.length() <= r.maxTextLen) {
             for (String k : strong) {
                 String kc = compact(k);
-                if (!kc.isEmpty() && compact.contains(kc)) return true;
+                if (!kc.isEmpty() && c.contains(kc)) return 1;
             }
         }
-        return false;
+        return 0;
+    }
+
+    /** 兼容旧签名的布尔版本。 */
+    static boolean textMatches(String raw, RuleStore.Rules r, List<String> texts, List<String> strong) {
+        return matchKind(raw, r, texts, strong) > 0;
     }
 
     /**
@@ -158,7 +237,7 @@ final class SkipEngine {
             if (cn != null) {
                 String c = cn.toString();
                 if (c.contains("EditText") || c.contains("AutoCompleteTextView")
-                        || c.contains("SearchView") || c.contains("WebView")) {
+                        || c.contains("SearchView")) {
                     return true;
                 }
             }
@@ -167,29 +246,51 @@ final class SkipEngine {
         return false;
     }
 
+    /** 从 n 自身向上找可点击节点，返回层数；0=自身可点击，-1=没找到。 */
+    private static int clickableDepthOf(AccessibilityNodeInfo n) {
+        AccessibilityNodeInfo t = n;
+        for (int d = 0; d <= CLICK_PROBE_UP && t != null; d++) {
+            try {
+                if (t.isClickable() && t.isEnabled()) return d;
+            } catch (Throwable ignored) {
+            }
+            if (d == CLICK_PROBE_UP) break;
+            try {
+                t = t.getParent();
+            } catch (Throwable ignored) {
+                return -1;
+            }
+        }
+        return -1;
+    }
+
     // ------------------------------------------------------------------ 扫描
 
     /**
-     * 在窗口树里找跳过按钮。返回 null 表示没找到。
+     * 扫描一棵窗口树，把命中的节点收集为候选。
+     *
+     * @param winW / winH 该窗口的宽高，用于算面积占比与归一化坐标
      */
-    static Hit find(AccessibilityNodeInfo root, RuleStore.Rules r, String pkg) {
-        if (root == null) return null;
+    static void collect(AccessibilityNodeInfo root, int winW, int winH,
+                        RuleStore.Rules r, String pkg, List<Cand> out, int[] budget) {
+        if (root == null) return;
 
         List<String> texts = r.textsFor(pkg);
         List<String> ids = r.idsFor(pkg);
 
-        // 注意：从 API 33 起 AccessibilityNodeInfo.recycle() 已废弃且为空操作，
-        // 手动回收反而容易造成 use-after-free 崩溃，这里交给 GC 处理。
+        // 注意：API 33 起 AccessibilityNodeInfo.recycle() 已废弃且为空操作，
+        // 手动回收反而容易 use-after-free，这里交给 GC。
         List<AccessibilityNodeInfo> stack = new ArrayList<AccessibilityNodeInfo>();
         stack.add(root);
 
-        Hit hit = null;
+        Rect rect = new Rect();
         int seen = 0;
 
-        while (!stack.isEmpty() && seen < MAX_NODES) {
+        while (!stack.isEmpty() && seen < budget[0]) {
             AccessibilityNodeInfo n = stack.remove(stack.size() - 1);
             if (n == null) continue;
             seen++;
+            budget[0]--;
 
             String viewId = null;
             try {
@@ -200,36 +301,107 @@ final class SkipEngine {
             String txt = norm(n.getText());
             String desc = norm(n.getContentDescription());
 
+            int kindText = matchKind(txt, r, texts, r.strongTexts);
+            int kindDesc = matchKind(desc, r, texts, r.strongTexts);
+            int kind = Math.max(kindText, kindDesc);
             boolean byId = idMatches(viewId, ids);
-            boolean byText = textMatches(txt, r, texts, r.strongTexts)
-                    || textMatches(desc, r, texts, r.strongTexts);
 
-            if ((byId || byText) && !isEditable(n)) {
-                String reason = byId
-                        ? ("控件ID " + shortId(viewId))
-                        : ("文字 “" + (txt.isEmpty() ? desc : txt) + "”");
-                hit = new Hit(n, reason);
-                break;
+            if ((byId || kind > 0) && !isEditable(n)) {
+                int w = 0;
+                int h = 0;
+                try {
+                    n.getBoundsInScreen(rect);   // 返回 void
+                    w = rect.width();
+                    h = rect.height();
+                } catch (Throwable ignored) {
+                }
+
+                double areaRatio = 0.0;
+                if (winW > 0 && winH > 0 && w > 0 && h > 0) {
+                    areaRatio = (double) w * h / ((double) winW * winH);
+                }
+
+                // 太大的节点不可能是「跳过」小按钮，直接不候选
+                if (areaRatio <= MAX_AREA_RATIO) {
+                    Cand c = new Cand();
+                    c.node = n;
+                    c.idHit = byId;
+                    c.exactHit = kind == 2;
+                    c.strongHit = kind == 1;
+                    c.hasDigit = hasDigit(txt) || hasDigit(desc);
+                    c.areaRatio = areaRatio;
+
+                    if (winW > 0 && winH > 0 && w > 0 && h > 0) {
+                        c.nx = rect.exactCenterX() / winW;
+                        c.ny = rect.exactCenterY() / winH;
+                    }
+
+                    try {
+                        c.clickable = n.isClickable() && n.isEnabled();
+                    } catch (Throwable ignored) {
+                    }
+                    c.clickableDepth = clickableDepthOf(n);
+
+                    String shown = !txt.isEmpty() ? txt : desc;
+                    if (byId) {
+                        c.reason = "控件ID " + shortId(viewId)
+                                + (shown.isEmpty() ? "" : "（" + shown + "）");
+                    } else {
+                        c.reason = "文字 “" + shown + "”";
+                    }
+                    out.add(c);
+                }
             }
 
-            int c = 0;
+            int cn = 0;
             try {
-                c = n.getChildCount();
+                cn = n.getChildCount();
             } catch (Throwable ignored) {
             }
-            for (int i = c - 1; i >= 0; i--) {
+            for (int i = cn - 1; i >= 0; i--) {
                 AccessibilityNodeInfo ch = null;
                 try {
                     ch = n.getChild(i);
                 } catch (Throwable ignored) {
                 }
-                if (ch != null) {
-                    stack.add(ch);
-                }
+                if (ch != null) stack.add(ch);
             }
         }
+    }
 
-        return hit;
+    /** 从候选里挑分最高的；低于 MIN_SCORE 返回 null。 */
+    static Cand pickBest(List<Cand> cands) {
+        Cand best = null;
+        for (Cand c : cands) {
+            if (c.score() < MIN_SCORE) continue;
+            if (best == null || c.score() > best.score()) best = c;
+        }
+        return best;
+    }
+
+    /**
+     * 遍历所有窗口找跳过按钮。返回 null 表示没找到。
+     *
+     * @param roots 各窗口的根节点（由服务层用 getWindows() 收集）
+     */
+    static Cand findBest(List<AccessibilityNodeInfo> roots, List<int[]> sizes,
+                         RuleStore.Rules r, String pkg) {
+        if (roots == null || roots.isEmpty()) return null;
+
+        List<Cand> cands = new ArrayList<Cand>();
+        int[] budget = new int[]{MAX_NODES};
+
+        for (int i = 0; i < roots.size(); i++) {
+            if (budget[0] <= 0) break;
+            int w = 0;
+            int h = 0;
+            if (sizes != null && i < sizes.size() && sizes.get(i) != null) {
+                w = sizes.get(i)[0];
+                h = sizes.get(i)[1];
+            }
+            collect(roots.get(i), w, h, r, pkg, cands, budget);
+        }
+        return pickBest(cands);
     }
 
     static String shortId(String viewId) {
@@ -255,7 +427,6 @@ final class SkipEngine {
     static boolean clickNode(AccessibilityService svc, AccessibilityNodeInfo n) {
         if (n == null) return false;
 
-        // 1) 自身可点击
         try {
             if (n.isClickable() && n.isEnabled()
                     && n.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
@@ -264,10 +435,8 @@ final class SkipEngine {
         } catch (Throwable ignored) {
         }
 
-        // 2) 自身坐标精准点击
         if (hasBounds(n) && tap(svc, n)) return true;
 
-        // 3) 向上找可点击祖先兜底
         AccessibilityNodeInfo t = n;
         for (int i = 0; i < MAX_ANCESTOR_UP && t != null; i++) {
             AccessibilityNodeInfo parent = null;
@@ -292,7 +461,6 @@ final class SkipEngine {
     private static boolean hasBounds(AccessibilityNodeInfo n) {
         Rect r = new Rect();
         try {
-            // 注意：getBoundsInScreen(Rect) 返回 void，不是 boolean
             n.getBoundsInScreen(r);
         } catch (Throwable t) {
             return false;
@@ -308,11 +476,11 @@ final class SkipEngine {
         } catch (Throwable t) {
             return false;
         }
-        if (r.width() <= 0 || r.height() <= 0) return false;
+        return tapAt(svc, r.exactCenterX(), r.exactCenterY());
+    }
 
-        float x = r.exactCenterX();
-        float y = r.exactCenterY();
-
+    /** 在屏幕指定坐标做一次点击。 */
+    static boolean tapAt(AccessibilityService svc, float x, float y) {
         try {
             Path p = new Path();
             p.moveTo(x, y);
@@ -323,5 +491,15 @@ final class SkipEngine {
         } catch (Throwable t) {
             return false;
         }
+    }
+
+    /**
+     * 兜底：按归一化坐标盲点一次（默认右上角）。
+     * 仅在开启「盲点兜底」且本窗口完全找不到任何候选时才会被调用。
+     */
+    static boolean tapNormalized(AccessibilityService svc, int w, int h,
+                                 double nx, double ny) {
+        if (w <= 0 || h <= 0) return false;
+        return tapAt(svc, (float) (w * nx), (float) (h * ny));
     }
 }

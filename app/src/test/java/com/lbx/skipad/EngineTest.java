@@ -1,5 +1,6 @@
 package com.lbx.skipad;
 
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 
@@ -40,10 +41,10 @@ public class EngineTest {
         check("strongTexts 非空", !r.strongTexts.isEmpty());
         check("skipIds 非空", !r.skipIds.isEmpty());
         check("excludeApps 非空", !r.excludeApps.isEmpty());
-        eq("scanIntervalMs", r.scanIntervalMs, 120);
+        eq("scanIntervalMs", r.scanIntervalMs, 100);
         eq("maxTextLen", r.maxTextLen, 8);
         eq("maxWaitMs", r.maxWaitMs, 15000);
-        eq("retryLimit", r.retryLimit, 5);
+        eq("retryLimit", r.retryLimit, 8);
         eq("watchAll", r.watchAll, true);
 
         System.out.println("== 文本归一化 ==");
@@ -195,11 +196,125 @@ public class EngineTest {
         eq("retryLimit 下限 1", clamp.retryLimit, 1);
         eq("maxWaitMs 上限 120000", clamp.maxWaitMs, 120000);
 
+        // ================================================================
+        // v2 新增：候选打分
+        // ================================================================
+        System.out.println("== v2 打分 ==");
+
+        // 理想候选：精确文字 + 可点 + 小而靠右上 + 带倒计时
+        SkipEngine.Cand good = cand(true, true, false, true, 0, 0.03, 0.88, 0.06, true);
+        // 只有精确文字，其它都差
+        SkipEngine.Cand plain = cand(false, true, false, false, -1, 0.40, 0.50, 0.50, false);
+        // 大块容器：面积占比超标
+        SkipEngine.Cand huge = cand(false, false, false, false, -1, 0.90, 0.50, 0.50, false);
+
+        check("理想候选分数 >= 150", good.score() >= 150);
+        check("理想候选分数 > 普通候选", good.score() > plain.score());
+        check("普通候选分数 > 大容器", plain.score() > huge.score());
+        check("大容器分数低于阈值", huge.score() < SkipEngine.MIN_SCORE);
+
+        // 单项覆盖
+        SkipEngine.Cand idOnly = cand(true, false, false, false, -1, 0.5, 0.5, 0.5, false);
+        check("仅控件 ID 命中 -> 60 分", idOnly.score() == SkipEngine.S_ID);
+        SkipEngine.Cand exactOnly = cand(false, true, false, false, -1, 0.5, 0.5, 0.5, false);
+        check("仅精确文字 -> 80 分", exactOnly.score() == SkipEngine.S_EXACT);
+        SkipEngine.Cand strongOnly = cand(false, false, true, false, -1, 0.5, 0.5, 0.5, false);
+        check("仅强关键词 -> 40 分", strongOnly.score() == SkipEngine.S_STRONG);
+
+        // 位置加成
+        SkipEngine.Cand topRight = cand(false, true, false, false, -1, 0.5, 0.9, 0.05, false);
+        SkipEngine.Cand center = cand(false, true, false, false, -1, 0.5, 0.5, 0.5, false);
+        check("右上角 > 正中", topRight.score() > center.score());
+        SkipEngine.Cand bottom = cand(false, true, false, false, -1, 0.5, 0.5, 0.9, false);
+        check("底部有加成", bottom.score() > center.score());
+        SkipEngine.Cand small = cand(false, true, false, false, -1, 0.04, 0.5, 0.5, false);
+        check("小按钮 > 中等按钮", small.score() > center.score());
+
+        // 可点击祖先深度
+        SkipEngine.Cand anc1 = cand(false, true, false, false, 1, 0.5, 0.5, 0.5, false);
+        SkipEngine.Cand anc2 = cand(false, true, false, false, 2, 0.5, 0.5, 0.5, false);
+        SkipEngine.Cand ancNone = cand(false, true, false, false, -1, 0.5, 0.5, 0.5, false);
+        check("深度1 > 深度2", anc1.score() > anc2.score());
+        check("深度2 > 无祖先", anc2.score() > ancNone.score());
+
+        // 倒计时加成
+        SkipEngine.Cand digit = cand(false, true, false, false, -1, 0.5, 0.5, 0.5, true);
+        check("带数字有加成", digit.score() > center.score());
+
+        // pickBest
+        List<SkipEngine.Cand> pool = new ArrayList<SkipEngine.Cand>();
+        pool.add(plain);
+        pool.add(huge);
+        pool.add(good);
+        check("pickBest 选中最优", SkipEngine.pickBest(pool) == good);
+
+        List<SkipEngine.Cand> onlyBad = new ArrayList<SkipEngine.Cand>();
+        onlyBad.add(huge);
+        check("全部低于阈值 -> null", SkipEngine.pickBest(onlyBad) == null);
+        check("空列表 -> null", SkipEngine.pickBest(new ArrayList<SkipEngine.Cand>()) == null);
+
+        System.out.println("== v2 matchKind ==");
+        eq("精确匹配返回 2", SkipEngine.matchKind("跳过广告", r, texts, strong), 2);
+        eq("包含匹配返回 1", SkipEngine.matchKind("跳过5", r, texts, strong), 1);
+        eq("不匹配返回 0", SkipEngine.matchKind("首页", r, texts, strong), 0);
+        eq("黑名单返回 0", SkipEngine.matchKind("跳过此步骤", r, texts, strong), 0);
+        eq("空返回 0", SkipEngine.matchKind("", r, texts, strong), 0);
+
+        System.out.println("== v2 hasDigit ==");
+        check("跳过5 有数字", SkipEngine.hasDigit("跳过5"));
+        check("5s 有数字", SkipEngine.hasDigit("5s"));
+        check("跳过 无数字", !SkipEngine.hasDigit("跳过"));
+        check("null 无数字", !SkipEngine.hasDigit(null));
+
+        System.out.println("== v2 默认规则 ==");
+        eq("retryLimit=8", r.retryLimit, 8);
+        eq("scanIntervalMs=100", r.scanIntervalMs, 100);
+        eq("blindTapEnabled 默认关", r.blindTapEnabled, false);
+        eq("blindTapX 默认 0.86", r.blindTapX, 0.86);
+        eq("blindTapY 默认 0.07", r.blindTapY, 0.07);
+        check("strongTexts 含 skip", r.strongTexts.contains("skip"));
+        check("QQ音乐有单独配置", r.apps.containsKey("com.tencent.qqmusic"));
+        eq("QQ音乐显示名", r.nameOf("com.tencent.qqmusic"), "QQ音乐");
+        check("跳过此广告 精确命中",
+                SkipEngine.matchKind("跳过此广告", r, r.textsFor(null), r.strongTexts) == 2);
+        check("关闭此广告 精确命中",
+                SkipEngine.matchKind("关闭此广告", r, r.textsFor(null), r.strongTexts) == 2);
+        check("跳过广告 > 精确命中",
+                SkipEngine.matchKind("跳过广告 >", r, r.textsFor(null), r.strongTexts) == 2);
+
+        System.out.println("== v2 盲点参数钳制 ==");
+        RuleStore.Rules bt = RuleStore.parse(
+                "{\"global\":{\"blindTapEnabled\":true,\"blindTapX\":5.0,\"blindTapY\":-3.0},"
+                        + "\"skipTexts\":[\"跳过\"],\"strongTexts\":[\"跳过\"]}");
+        eq("blindTapEnabled 生效", bt.blindTapEnabled, true);
+        check("blindTapX 钳到 1.0", Math.abs(bt.blindTapX - 1.0) < 1e-9);
+        check("blindTapY 钳到 0.0", Math.abs(bt.blindTapY - 0.0) < 1e-9);
+
         System.out.println();
         System.out.println("========================");
         System.out.println("通过 " + pass + " 项，失败 " + fail + " 项");
         System.out.println("========================");
         if (fail > 0) System.exit(1);
+    }
+
+    /**
+     * 造一个候选。字段都是纯数据，不碰 AccessibilityNodeInfo，
+     * 所以可以在桌面 JVM 上直接测打分逻辑。
+     */
+    private static SkipEngine.Cand cand(boolean idHit, boolean exactHit, boolean strongHit,
+                                        boolean clickable, int clickableDepth, double areaRatio,
+                                        double nx, double ny, boolean hasDigit) {
+        SkipEngine.Cand c = new SkipEngine.Cand();
+        c.idHit = idHit;
+        c.exactHit = exactHit;
+        c.strongHit = strongHit;
+        c.clickable = clickable;
+        c.clickableDepth = clickableDepth;
+        c.areaRatio = areaRatio;
+        c.nx = nx;
+        c.ny = ny;
+        c.hasDigit = hasDigit;
+        return c;
     }
 
     private static String readResource(String path) throws Exception {
