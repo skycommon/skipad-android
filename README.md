@@ -34,10 +34,10 @@ v2.0 的改动：
 
 **推荐从 Releases 页面下载：**
 
-### 👉 [点此下载 SkipAd-v2.0.apk](https://github.com/skycommon/skipad-android/releases/latest)
+### 👉 [点此下载 SkipAd-v2.0.apk](https://github.com/skycommon/skipad-android/releases/latest/download/SkipAd-v2.0.apk)
 
 也可以直接用固定地址：
-`https://github.com/skycommon/skipad-android/releases/download/v2.0/SkipAd-v2.0.apk`
+`https://github.com/skycommon/skipad-android/releases/latest/download/SkipAd-v2.0.apk`
 
 > Release 附件名只能是 ASCII，所以下载得到的文件叫 `SkipAd-v2.0.apk`；
 > 与本仓库 `apk/跳过广告-v2.0.apk` 是**同一个文件**（SHA-256 一致）。

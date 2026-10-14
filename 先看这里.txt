@@ -8,7 +8,7 @@
  从 GitHub Releases 下载（推荐，点开就是最新版）：
    https://github.com/skycommon/skipad-android/releases/latest
  固定直链：
-   https://github.com/skycommon/skipad-android/releases/download/v2.0/SkipAd-v2.0.apk
+   https://github.com/skycommon/skipad-android/releases/latest/download/SkipAd-v2.0.apk
  （Release 附件名只能用英文，所以下载下来叫 SkipAd-v2.0.apk，
    和源码包里的 跳过广告-v2.0.apk 是完全同一个文件。）
 
