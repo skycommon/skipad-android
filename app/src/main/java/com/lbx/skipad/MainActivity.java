@@ -93,7 +93,7 @@ public class MainActivity extends android.app.Activity {
         root.addView(t);
 
         TextView s = new TextView(this);
-        s.setText("v2.0 · 多窗口扫描 · 本地运行 · 不联网");
+        s.setText("v2.1 · 多窗口扫描 · 本地运行 · 不联网");
         s.setTextSize(13);
         s.setTextColor(C_SUB);
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(

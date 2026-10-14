@@ -307,6 +307,54 @@ public class EngineTest {
         check("blindTapX 钳到 1.0", Math.abs(bt.blindTapX - 1.0) < 1e-9);
         check("blindTapY 钳到 0.0", Math.abs(bt.blindTapY - 0.0) < 1e-9);
 
+        // ================================================================
+        // 「有时能跳、有时不行」的两个根因（竞态）相关逻辑
+        // ================================================================
+        System.out.println("== 轮询间隔（不依赖事件也能扫） ==");
+        eq("pollIntervalMs 默认 250", r.pollIntervalMs, 250);
+        RuleStore.Rules pollClamp = RuleStore.parse(
+                "{\"global\":{\"pollIntervalMs\":5},\"skipTexts\":[\"跳过\"],\"strongTexts\":[\"跳过\"]}");
+        eq("pollIntervalMs 下限 80", pollClamp.pollIntervalMs, 80);
+        RuleStore.Rules pollClamp2 = RuleStore.parse(
+                "{\"global\":{\"pollIntervalMs\":99999},\"skipTexts\":[\"跳过\"],\"strongTexts\":[\"跳过\"]}");
+        eq("pollIntervalMs 上限 2000", pollClamp2.pollIntervalMs, 2000);
+
+        System.out.println("== 窗口排除（多窗口扫描的安全边界） ==");
+        // 桌面窗口且当前监听的不是桌面 -> 跳过
+        check("桌面窗口被跳过", r.isExcludedWindow("com.miui.home", "com.tencent.qqmusic"));
+        check("系统设置窗口被跳过", r.isExcludedWindow("com.android.settings", "com.tencent.qqmusic"));
+        check("安装器窗口被跳过", r.isExcludedWindow("com.android.packageinstaller", "com.tencent.qqmusic"));
+        // 当前监听的应用本身即使在排除名单里也不跳过（否则永远扫不到）
+        check("正在监听的应用不被跳过", !r.isExcludedWindow("com.tencent.qqmusic", "com.tencent.qqmusic"));
+        // 广告 SDK 的独立窗口包名不在名单里 -> 正常扫描（这是能跳成功的关键）
+        check("广告SDK窗口照常扫描", !r.isExcludedWindow("com.qq.e.ads", "com.tencent.qqmusic"));
+        check("未知包名照常扫描", !r.isExcludedWindow("com.bytedance.sdk.openadsdk", "com.tencent.qqmusic"));
+        // 拿不到包名时不冒险跳过（宁可扫描，否则广告在无名窗口里就漏了）
+        check("包名为 null 不跳过", !r.isExcludedWindow(null, "com.tencent.qqmusic"));
+        check("包名为空不跳过", !r.isExcludedWindow("", "com.tencent.qqmusic"));
+
+        System.out.println("== 前台切换决策（decideForeground，五种情况） ==");
+        String qq = "com.tencent.qqmusic";
+        // 正在监听 QQ音乐
+        eq("同应用 -> FG_SAME", r.decideForeground(qq, qq), RuleStore.Rules.FG_SAME);
+        eq("切到桌面 -> FG_KEEP", r.decideForeground("com.miui.home", qq), RuleStore.Rules.FG_KEEP);
+        eq("切到系统设置 -> FG_KEEP", r.decideForeground("com.android.settings", qq), RuleStore.Rules.FG_KEEP);
+        eq("切到系统UI -> FG_KEEP", r.decideForeground("com.android.systemui", qq), RuleStore.Rules.FG_KEEP);
+        // 广告 SDK 的包名不在排除名单里，watchAll=true 时它算「可监听」，
+        // 因此走 FG_SWITCH（重开一个观察窗口）。这是可接受的：
+        // 扫描本来就会遍历所有未排除窗口，QQ音乐那扇窗照样会被扫到，
+        // 而重开窗口只是把截止时间往后推，反而更容易等到广告渲染出来。
+        eq("广告SDK窗口 -> FG_SWITCH（无害）",
+                r.decideForeground("com.qq.e.ads", qq), RuleStore.Rules.FG_SWITCH);
+        eq("切到微信 -> FG_SWITCH", r.decideForeground("com.tencent.mm", qq), RuleStore.Rules.FG_SWITCH);
+        // 没在观察时（这是上一版写出过的回归：watchPkg=null 时必须能开始监听）
+        eq("没在观察+需监听应用 -> FG_START", r.decideForeground(qq, null), RuleStore.Rules.FG_START);
+        eq("没在观察+微信 -> FG_START", r.decideForeground("com.tencent.mm", null), RuleStore.Rules.FG_START);
+        eq("没在观察+桌面 -> FG_IGNORE", r.decideForeground("com.miui.home", null), RuleStore.Rules.FG_IGNORE);
+        eq("没在观察+自身 -> FG_IGNORE", r.decideForeground("com.lbx.skipad", null), RuleStore.Rules.FG_IGNORE);
+        eq("空包名 -> FG_IGNORE", r.decideForeground("", qq), RuleStore.Rules.FG_IGNORE);
+        eq("null 包名 -> FG_IGNORE", r.decideForeground(null, qq), RuleStore.Rules.FG_IGNORE);
+
         System.out.println();
         System.out.println("========================");
         System.out.println("通过 " + pass + " 项，失败 " + fail + " 项");

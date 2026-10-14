@@ -4,6 +4,7 @@
   "global": {
     "watchAll": true,
     "scanIntervalMs": 100,
+    "pollIntervalMs": 250,
     "maxTextLen": 8,
     "maxWaitMs": 15000,
     "retryLimit": 8,

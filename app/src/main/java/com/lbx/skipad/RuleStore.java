@@ -147,6 +147,9 @@ final class RuleStore {
             r.blindTapEnabled = g.optBoolean("blindTapEnabled", false);
             r.blindTapX = clampDouble(g.optDouble("blindTapX", 0.86), 0.0, 1.0);
             r.blindTapY = clampDouble(g.optDouble("blindTapY", 0.07), 0.0, 1.0);
+            // 轮询间隔：即使一个无障碍事件都没有，也要按这个周期主动扫描。
+            // 这是「有时能跳、有时不能」的根治手段（原实现纯事件驱动）。
+            r.pollIntervalMs = clamp(g.optInt("pollIntervalMs", 250), 80, 2000);
         }
 
         r.skipTexts = toList(root.optJSONArray("skipTexts"));
@@ -215,6 +218,8 @@ final class RuleStore {
         boolean blindTapEnabled = false;
         double blindTapX = 0.86;
         double blindTapY = 0.07;
+        /** 主动轮询间隔（毫秒）。即使没有任何无障碍事件，也按此周期扫描。 */
+        int pollIntervalMs = 250;
 
         List<String> skipTexts = new ArrayList<String>();
         List<String> strongTexts = new ArrayList<String>();
@@ -232,6 +237,52 @@ final class RuleStore {
             if (ar != null && !ar.enabled) return false;
             return watchAll || ar != null;
         }
+
+        /**
+         * 扫描时是否应跳过这个窗口（按窗口所属包名判断）。
+         *
+         * 多窗口扫描带来一个新风险：遍历所有窗口后，用户按 Home 回桌面时
+         * 桌面窗口也会被扫到，若桌面上恰有像「跳过」的文字就会被误点。
+         * 所以排除名单里的包名（桌面/设置/安装器/系统 UI）整窗跳过 ——
+         * 但如果它正是我们当前在监听的应用，则照常扫描。
+         *
+         * 广告 SDK 的独立窗口包名不在此名单内，所以不受影响。
+         */
+        boolean isExcludedWindow(String winPkg, String watchingPkg) {
+            if (winPkg == null || winPkg.isEmpty()) return false;   // 拿不到包名时不冒险跳过
+            if (winPkg.equals(watchingPkg)) return false;           // 正是当前监听的应用
+            return excludeApps.contains(winPkg);
+        }
+
+        /**
+         * 收到「前台应用变了」事件时该怎么办。
+         *
+         * 这是「有时能跳、有时跳不掉」的根因落点，逻辑很容易写错，
+         * 所以抽成一个纯函数，把四种情况显式区分开并单独测：
+         *
+         *  - 原实现：不判包名直接 endWatch()，于是**任何**窗口状态变化都会掐断观察
+         *    （包括切到桌面、系统窗口上报等）。广告往往在观察被掐断之后才渲染出来，
+         *    能不能跳就全看这些无关事件有没有恰好插进来 —— 表现为时灵时不灵。
+         *  - 但也不能矫枉过正：没在观察时必须能**开始**观察，
+         *    否则切进 App 时 watchPkg 为 null，就永远开不了监听。
+         */
+        int decideForeground(String pkg, String watchingPkg) {
+            if (pkg == null || pkg.isEmpty()) return FG_IGNORE;
+            if (pkg.equals(watchingPkg)) return FG_SAME;          // 同一应用内切界面
+            if (watchingPkg != null) {
+                // 正在观察中：只有切到另一个「需要监听」的应用才结束旧观察；
+                // 其它包名（桌面/设置/系统UI/广告SDK）一律保留观察，继续等广告。
+                return shouldWatch(pkg) ? FG_SWITCH : FG_KEEP;
+            }
+            // 没在观察：新应用需要监听就开始，否则忽略
+            return shouldWatch(pkg) ? FG_START : FG_IGNORE;
+        }
+
+        static final int FG_SAME = 0;    // 同一应用，什么都不做
+        static final int FG_KEEP = 1;    // 保留当前观察（新包名无需监听）
+        static final int FG_SWITCH = 2;  // 结束旧观察，改监听新应用
+        static final int FG_START = 3;   // 当前没在观察，开始监听新应用
+        static final int FG_IGNORE = 4;  // 当前没在观察，新应用也无需监听
 
         /** 组合该应用生效的文字规则。 */
         List<String> textsFor(String pkg) {

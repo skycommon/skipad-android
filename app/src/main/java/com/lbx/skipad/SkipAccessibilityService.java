@@ -69,6 +69,8 @@ public class SkipAccessibilityService extends AccessibilityService {
      * 抓到的只是 App 主界面，对排查毫无帮助。
      */
     private boolean diagCapturedEarly = false;
+    /** 是否已排入一次主动轮询。 */
+    private boolean pollScheduled = false;
     /** 屏幕尺寸缓存。 */
     private int screenW = 0;
     private int screenH = 0;
@@ -78,6 +80,35 @@ public class SkipAccessibilityService extends AccessibilityService {
         public void run() {
             scanScheduled = false;
             doScan();
+        }
+    };
+
+    /**
+     * 主动轮询任务。
+     *
+     * 为什么需要它（「有时能跳、有时不行」的根因之二）：
+     * 原实现完全靠无障碍事件驱动 —— 只有收到 window 内容变化事件才扫描。
+     * 但广告若是纯图片 / 视频 / SurfaceView，渲染时可能**一个事件都不发**，
+     * 或者事件在广告出现的瞬间就发完了；这时我们就只扫到「广告还没出来」或
+     * 「广告已经变了但没通知」的那一帧，于是漏掉。
+     * 加了这个定时器后，观察窗口内会按 pollIntervalMs 周期主动扫描，
+     * 不依赖任何事件，是否命中就只取决于广告在不在屏幕上。
+     */
+    private final Runnable pollTask = new Runnable() {
+        @Override
+        public void run() {
+            pollScheduled = false;
+            if (watchPkg == null) return;
+            long now = android.os.SystemClock.uptimeMillis();
+            if (now > watchDeadline) {
+                endWatch(true);
+                return;
+            }
+            // 不在这里判断 skippedOnce：doScan() 内部已经处理了
+            // （点掉过就 endWatch(false) 收工），交给它更不容易漏掉善后。
+            doScan();
+            // doScan 可能已经 endWatch（命中或超时），那就不要再排下一次了
+            if (watchPkg != null) schedulePoll();
         }
     };
 
@@ -109,7 +140,9 @@ public class SkipAccessibilityService extends AccessibilityService {
     public boolean onUnbind(android.content.Intent intent) {
         instance = null;
         handler.removeCallbacks(scanTask);
+        handler.removeCallbacks(pollTask);
         scanScheduled = false;
+        pollScheduled = false;
         Log.i(TAG, "服务已断开");
         return super.onUnbind(intent);
     }
@@ -118,6 +151,7 @@ public class SkipAccessibilityService extends AccessibilityService {
     public void onDestroy() {
         instance = null;
         handler.removeCallbacks(scanTask);
+        handler.removeCallbacks(pollTask);
         super.onDestroy();
     }
 
@@ -173,15 +207,29 @@ public class SkipAccessibilityService extends AccessibilityService {
     private void onForegroundChanged(String pkg, long now) {
         reloadRules();
 
-        if (pkg.equals(watchPkg)) {
-            // 同一应用内的界面切换，不重置窗口
+        RuleStore.Rules r = rules;
+        if (r == null) return;
+
+        // 决策抽成了纯函数（RuleStore.Rules.decideForeground），便于单测覆盖：
+        //   FG_SAME   同一应用内切界面 -> 不动
+        //   FG_KEEP   新包名无需监听（桌面/设置/系统UI/广告SDK）-> 保留观察，继续等广告
+        //   FG_SWITCH 切到另一个需监听的应用 -> 结束旧观察，改监听它
+        //   FG_START  当前没在观察，新应用需监听 -> 开始监听
+        //   FG_IGNORE 当前没在观察，新应用也无需监听 -> 不动
+        //
+        // 这里修掉的是「有时能跳、有时跳不掉」：原实现不判包名一律 endWatch，
+        // 任何无关的窗口状态变化都会掐断观察，广告往往在掐断后才渲染出来。
+        int action = r.decideForeground(pkg, watchPkg);
+
+        if (action == RuleStore.Rules.FG_SAME || action == RuleStore.Rules.FG_IGNORE
+                || action == RuleStore.Rules.FG_KEEP) {
+            // 同一应用内切界面 / 无需监听 / 广告SDK等窗口打断 —— 都不动当前观察
             return;
         }
 
-        if (watchPkg != null) endWatch(false);
-
-        RuleStore.Rules r = rules;
-        if (r == null || !r.shouldWatch(pkg)) return;
+        if (action == RuleStore.Rules.FG_SWITCH && watchPkg != null) {
+            endWatch(false);
+        }
 
         watchPkg = pkg;
         watchStart = now;
@@ -195,6 +243,7 @@ public class SkipAccessibilityService extends AccessibilityService {
         updateScreenSize();
 
         scheduleScan(now);
+        schedulePoll();
         Log.i(TAG, "开始监听 " + pkg);
     }
 
@@ -209,7 +258,9 @@ public class SkipAccessibilityService extends AccessibilityService {
         }
         watchPkg = null;
         handler.removeCallbacks(scanTask);
+        handler.removeCallbacks(pollTask);
         scanScheduled = false;
+        pollScheduled = false;
     }
 
     private void scheduleScan(long now) {
@@ -220,6 +271,15 @@ public class SkipAccessibilityService extends AccessibilityService {
         long delay = since >= r.scanIntervalMs ? 0 : (r.scanIntervalMs - since);
         scanScheduled = true;
         handler.postDelayed(scanTask, delay);
+    }
+
+    /** 排入下一次主动轮询（与事件驱动的 scheduleScan 互补）。 */
+    private void schedulePoll() {
+        RuleStore.Rules r = rules;
+        if (r == null || watchPkg == null) return;
+        if (pollScheduled) return;
+        pollScheduled = true;
+        handler.postDelayed(pollTask, r.pollIntervalMs);
     }
 
     private void reloadRules() {
@@ -264,6 +324,7 @@ public class SkipAccessibilityService extends AccessibilityService {
         List<AccessibilityNodeInfo> roots = new ArrayList<AccessibilityNodeInfo>();
         List<int[]> sizes = new ArrayList<int[]>();
         StringBuilder winInfo = new StringBuilder();
+        int skippedWins = 0;
 
         try {
             List<AccessibilityWindowInfo> wins = getWindows();
@@ -276,6 +337,26 @@ public class SkipAccessibilityService extends AccessibilityService {
                     } catch (Throwable ignored) {
                     }
                     if (rt == null) continue;
+
+                    // ------------------------------------------------------------
+                    // 安全过滤（多窗口扫描引入的新风险）：
+                    // 现在会遍历所有窗口，如果不加限制，用户按 Home 回到桌面后，
+                    // 桌面窗口也会被扫描，万一桌面上有像「跳过」的文字就会被误点。
+                    // 所以：窗口所属包名若在 excludeApps 里（桌面/设置/安装器/系统UI），
+                    // 除非它正是当前监听的应用，否则整窗跳过。
+                    //
+                    // 注意广告 SDK 的独立窗口包名**不在** excludeApps 里，所以照常扫描。
+                    // ------------------------------------------------------------
+                    String wpkg = null;
+                    try {
+                        CharSequence pn = rt.getPackageName();
+                        if (pn != null) wpkg = pn.toString();
+                    } catch (Throwable ignored) {
+                    }
+                    if (r.isExcludedWindow(wpkg, watchPkg)) {
+                        skippedWins++;
+                        continue;
+                    }
 
                     Rect b = new Rect();
                     try {
@@ -320,7 +401,8 @@ public class SkipAccessibilityService extends AccessibilityService {
         }
 
         if (best == null) {
-            lastScanReason = "未命中（窗口: " + winInfo + "）";
+            lastScanReason = "未命中（窗口: " + winInfo
+                    + (skippedWins > 0 ? "，已跳过 " + skippedWins + " 个排除窗口" : "") + "）";
 
             // 抓诊断快照：趁广告还在屏幕上时抓，而不是等 15 秒超时。
             // 开屏广告一般只显示 3~5 秒，等超时抓到的只会是 App 主界面。

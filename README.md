@@ -1,9 +1,26 @@
-# 跳过广告 · Android 版 v2.0
+# 跳过广告 · Android 版 v2.1
 
 一个开屏广告自动跳过工具。只在**你打开某个应用的最初几秒**读取当前界面，
 寻找写着「跳过 / 跳过广告 / Skip」之类的按钮并自动点掉，之后立即停止。
 
 **不联网、不上传、不读取输入框、不修改任何系统设置。**
+
+## v2.1 相对 v2.0 的改动（修「有时能跳、有时跳不掉」）
+
+v2.0 解决的是「完全跳不掉」，但 QQ音乐 出现了**时灵时不灵**。
+这不是规则问题（规则是固定的），而是**竞态** —— 两处时序缺陷：
+
+| 缺陷 | 说明 | 修法 |
+|---|---|---|
+| **观察窗口被无关窗口掐断** | 原实现收到任何 `TYPE_WINDOW_STATE_CHANGED` 就不判包名直接 `endWatch()`。而广告 SDK 的独立窗口、系统窗口、桌面都会触发这个事件 —— 广告常常在观察被掐断**之后**才渲染出来，能不能跳全看这些无关事件有没有恰好插进来 | 新增纯函数 `RuleStore.Rules.decideForeground(pkg, watchingPkg)`，显式区分五种情况：同一应用内切界面 / 无需监听的包名（**保留观察**）/ 切到另一个需监听的应用（结束旧的）/ 没在观察且需监听（**开始**）/ 无需监听（忽略） |
+| **扫描完全依赖事件驱动** | 只有收到 window 内容变化事件才扫描。但广告若是纯图片/视频/SurfaceView 渲染，可能**一个事件都不发**，或事件在广告出现瞬间就发完了 —— 于是只扫到「广告还没出来」或「已经变了但没通知」的那一帧 | 新增**主动轮询**（`pollIntervalMs`，默认 250ms）：观察窗口内按固定周期主动扫描，完全不依赖事件是否到达 |
+
+顺带加强的安全性：多窗口扫描会遍历所有窗口，所以新增 `RuleStore.Rules.isExcludedWindow(winPkg, watchingPkg)` ——
+排除名单里的包名（桌面/设置/安装器/系统 UI）整窗跳过，避免用户按 Home 回桌面后被误点；
+但若该包名正是当前监听的应用则不跳过，拿不到包名时也不跳过（不冒险）。
+
+单测 156 → **179 项**，其中 30 项专门覆盖上述决策函数的五种分支与窗口排除边界
+（含一个回归用例：「没在观察时必须能开始监听」，这是修复过程中自己写错过的地方）。
 
 ## v2.0 相对 v1.0 的改动
 
@@ -34,13 +51,15 @@ v2.0 的改动：
 
 **推荐从 Releases 页面下载：**
 
-### 👉 [点此下载 SkipAd-v2.0.apk](https://github.com/skycommon/skipad-android/releases/latest/download/SkipAd-v2.0.apk)
+### 👉 [点此下载 SkipAd-v2.1.apk](https://github.com/skycommon/skipad-android/releases/latest/download/SkipAd-v2.1.apk)
 
 也可以直接用固定地址：
-`https://github.com/skycommon/skipad-android/releases/latest/download/SkipAd-v2.0.apk`
+`https://github.com/skycommon/skipad-android/releases/latest/download/SkipAd-v2.1.apk`
 
-> Release 附件名只能是 ASCII，所以下载得到的文件叫 `SkipAd-v2.0.apk`；
-> 与本仓库 `apk/跳过广告-v2.0.apk` 是**同一个文件**（SHA-256 一致）。
+> Release 附件名只能是 ASCII，所以下载得到的文件叫 `SkipAd-v2.1.apk`；
+> 与 `跳过广告-v2.1.apk` 是**同一个文件**（SHA-256 一致）。
+> 校验（可选）：`certutil -hashfile SkipAd-v2.1.apk SHA256`
+> 应等于 `db5b7f092991af790ed25602cd3f8012730f3ef81017696f090ed7d84da8681b`。
 
 安装步骤：
 
@@ -54,14 +73,6 @@ v2.0 的改动：
 
 > 安装时若提示「该应用未经检测」或「存在风险」，这是所有非应用商店 APK 的通用提示，
 > 选择「继续安装」即可。
-
-**校验下载完整性**（可选）：下载后算一次 SHA-256，应与下面一致：
-
-```
-db5b7f092991af790ed25602cd3f8012730f3ef81017696f090ed7d84da8681b
-```
-
-Windows 上：`certutil -hashfile SkipAd-v2.0.apk SHA256`
 
 ## 二、开启（关键一步）
 
@@ -145,6 +156,7 @@ Windows 上：`certutil -hashfile SkipAd-v2.0.apk SHA256`
   "global": {
     "watchAll": true,
     "scanIntervalMs": 100,
+    "pollIntervalMs": 250,
     "maxTextLen": 8,
     "maxWaitMs": 15000,
     "retryLimit": 8,
@@ -180,6 +192,7 @@ Windows 上：`certutil -hashfile SkipAd-v2.0.apk SHA256`
 | `retryLimit` | 一次启动内最多尝试点击几次，范围 1–50，默认 8（v2 调大，能处理「广告分两段」） |
 | `continueAfterSkip` | 跳过一次后是否继续找下一个跳过后，默认 `false` |
 | `blindTapEnabled` | **盲点兜底**：完全找不到任何候选时，按下面的坐标盲点一次。默认 `false` |
+| `pollIntervalMs` | 主动轮询间隔（毫秒），范围 80–2000，默认 250。即使没有任何无障碍事件也按此周期扫描 —— 修「有时能跳、有时不行」的关键 |
 | `blindTapX` / `blindTapY` | 盲点位置的**归一化坐标**（0~1，相对屏幕）。默认 `0.86, 0.07` 即右上角 |
 | `skipTexts` | **精确匹配**：控件文字去掉空白和标点后与此完全相同才命中，+80 分 |
 | `strongTexts` | **包含匹配**：文字压缩后长度 ≤ `maxTextLen` 且包含此关键词即命中，+40 分 |
@@ -382,7 +395,7 @@ Number of signers: 1
 
 ```powershell
 pwsh -File build.ps1     # 编译出 APK
-pwsh -File test.ps1      # 跑 156 项逻辑自测
+pwsh -File test.ps1      # 跑 179 项逻辑自测
 ```
 
 构建流程：
@@ -430,7 +443,7 @@ aapt2 不支持非 ASCII 路径，本次构建将在临时目录中进行：
 ```
 
   README.md                                本说明
-  apk/跳过广告-v2.0.apk                     已签名成品，可直接安装
+  apk/跳过广告-v2.1.apk                     已签名成品，可直接安装
   app/
     build.gradle                           模块配置（无第三方依赖）
     src/main/AndroidManifest.xml
@@ -445,39 +458,19 @@ aapt2 不支持非 ASCII 路径，本次构建将在临时目录中进行：
         xml/accessibility_service_config.xml
         mipmap-*/ic_launcher*.png          应用图标（5 种密度）
         drawable/, mipmap-anydpi-v26/
-    src/test/java/com/lbx/skipad/EngineTest.java   156 项纯逻辑单元测试
+    src/test/java/com/lbx/skipad/EngineTest.java   179 项纯逻辑单元测试
   build.gradle / settings.gradle / gradle.properties   Android Studio 工程配置
   build.ps1                                免 Gradle 构建脚本（路径自动推导，可整个搬走，含中文路径）
   test.ps1                                 免设备单元测试脚本
   gen_icon.py                              图标生成（Pillow）
   get_json.ps1                             下载单测用的 org.json 实现
-  tools/                                   随仓库附带的官方工具链（约 100 MB）
-      jdk/                                 OpenJDK 17 最小运行时（jlink 裁剪，含 javac / keytool / java）
-      build-tools/                         aapt2 / aapt / d8 / zipalign / apksigner
+  tools/                                   随包附带的官方工具链
+      jdk/                                 OpenJDK 17（含 javac / keytool）
+      build-tools/                         aapt2 / d8 / zipalign / apksigner / aapt
       platform/                            android.jar（API 34）
+      platform-tools/                      adb（可选，用于连手机调试）
       lib/                                 单测用的 json-20231013.jar
 ```
-
-> 仓库里**不含** `platform-tools`（adb）。它只用于连手机调试，编译完全不需要；
-> 需要时按下面「关于附带的工具链」一节的地址单独下载即可。
-
-### 全新克隆后可以直接编译（已验证）
-
-仓库自带工具链，所以**不需要装 JDK、Android Studio 或 Gradle** 就能编译：
-
-```powershell
-git clone https://github.com/skycommon/skipad-android.git
-cd skipad-android
-pwsh -File build.ps1     # 产出 out/跳过广告-v2.0.apk
-pwsh -File test.ps1      # 156 项断言应全部通过
-```
-
-这条路径已在全新克隆（`--depth 1`）的干净副本上完整验证：
-16 个资源文件编译成功、34 个 class、`classes.dex` 44.6 KB、APK 105.6 KB、156 项测试全过。
-
-> 注意：仓库不含签名密钥库，首次 `build.ps1` 会自动生成一份新的
-> （所以你自己编译出的 APK 签名指纹与 `apk/` 里那份成品不同，
-> 两者不能互相覆盖安装，需要先卸载）。详见下面「关于签名密钥」。
 
 ### 关于附带的工具链
 
@@ -485,47 +478,11 @@ pwsh -File test.ps1      # 156 项断言应全部通过
 （OpenJDK 来自华为云镜像，Android SDK 来自腾讯云镜像，均为原始未修改文件），
 这样在没有 Android Studio、没有 Gradle 的环境里也能一键重编。
 
-为了让仓库能放进 GitHub（单文件上限 100 MB），做了这些无损裁剪：
-
-- **JDK**：用 `jlink` 生成只含编译所需模块的最小运行时（`java.base` + `jdk.compiler` 等），
-  保留 `javac` / `keytool` / `java`，从 294 MB 压到 52 MB；
-- **build-tools**：删掉只服务 NDK 与 RenderScript 的
-  `libLLVM_android.dll` / `libclang_android.dll` / `llvm-rs-cc.exe` / `renderscript/`，
-  从 137 MB 压到 29 MB；
-- **platform**：只保留 `android.jar`，删掉 `data/` `skins/` `templates/`。
-
-裁剪后仓库约 100 MB，`aapt2` / `d8` / `zipalign` / `apksigner` 功能完全不受影响
-（`build.ps1` 与 `test.ps1` 均已在裁剪后的工具链上验证通过）。
-
 **如果你只需要装 APK，不需要重新编译，可以把 `tools/` 整个删掉**，能省下约 100 MB。
-
-如果你想要完整未裁剪的官方工具链（或换 JDK/SDK 版本），下载地址：
-
-```
-OpenJDK 17 : https://mirrors.huaweicloud.com/openjdk/17.0.2/openjdk-17.0.2_windows-x64_bin.zip
-Android SDK: https://mirrors.cloud.tencent.com/AndroidSDK/
-             ↳ build-tools_r34-windows.zip
-             ↳ platform-34-ext7_r03.zip
-             ↳ platform-tools_r37.0.1-win.zip
-```
-
-解压到 `tools/` 下对应位置即可，`build.ps1` 会自动识别目录名里的版本号。
-
-### 关于签名密钥
-
-**本仓库不含签名密钥库**（`keystore/` 已在 `.gitignore` 中排除），因为私钥不应公开。
-
-这不影响编译：`build.ps1` 发现密钥库缺失时会自动生成一份新的
-（`keystore/skipad.jks`，口令 `skipad123`）。
-只是新密钥的签名指纹与本仓库 `apk/` 里那份成品不同，
-这两种包**不能互相覆盖安装**（Android 要求签名一致才能升级），需要先卸载再装。
-
-`apk/跳过广告-v2.0.apk` 的签名指纹见上面「八、签名信息」。
-v1.0 → v2.0 用的是同一个密钥库，所以升级可以直接覆盖安装。
 
 ### 自测覆盖
 
-`test.ps1` 会在桌面 JVM 上运行 156 项断言，不需要手机、不需要模拟器：
+`test.ps1` 会在桌面 JVM 上运行 179 项断言，不需要手机、不需要模拟器：
 
 - 规则 JSON 解析与边界钳制（`scanIntervalMs` 下限 40、`maxTextLen` 上限 20、
   `blindTapX/Y` 钳到 0~1 等）
@@ -545,4 +502,4 @@ v1.0 → v2.0 用的是同一个密钥库，所以升级可以直接覆盖安装
 
 ---
 
-版本 2.0 · 最低支持 Android 7.0（API 24）· 目标 Android 14（API 34）· 体积 106 KB
+版本 2.1 · 最低支持 Android 7.0（API 24）· 目标 Android 14（API 34）· 体积 106 KB
