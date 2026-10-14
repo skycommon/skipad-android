@@ -284,12 +284,14 @@ final class SkipEngine {
         stack.add(root);
 
         Rect rect = new Rect();
-        int seen = 0;
 
-        while (!stack.isEmpty() && seen < budget[0]) {
+        // budget[0] 是所有窗口共享的节点预算，每访问一个节点减一。
+        // 注意不要再用一个独立的计数器去跟它比较：
+        // 「seen++ 的同时 budget[0]--」会让 seen + budget 恒定不变，
+        // 循环提前在预算一半时就结束。这里只以 budget 为准。
+        while (!stack.isEmpty() && budget[0] > 0) {
             AccessibilityNodeInfo n = stack.remove(stack.size() - 1);
             if (n == null) continue;
-            seen++;
             budget[0]--;
 
             String viewId = null;

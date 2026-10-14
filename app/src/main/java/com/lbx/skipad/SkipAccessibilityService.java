@@ -51,6 +51,7 @@ public class SkipAccessibilityService extends AccessibilityService {
 
     // 当前观察窗口状态
     private String watchPkg = null;
+    private long watchStart = 0L;
     private long watchDeadline = 0L;
     /** 本窗口内已经尝试点击的次数，超过 retryLimit 就停止，避免反复误点。 */
     private int attempts = 0;
@@ -60,6 +61,14 @@ public class SkipAccessibilityService extends AccessibilityService {
     private boolean scanScheduled = false;
     /** 本次观察里是否已经做过盲点兜底，避免重复盲点。 */
     private boolean blindTried = false;
+    /**
+     * 本次观察里是否已经抓过「开屏首批界面」快照。
+     *
+     * 为什么要在第一次扫描时就抓：开屏广告通常只显示 3~5 秒，
+     * 而观察窗口是 15 秒 —— 等到超时才抓，广告早就消失了，
+     * 抓到的只是 App 主界面，对排查毫无帮助。
+     */
+    private boolean diagCapturedEarly = false;
     /** 屏幕尺寸缓存。 */
     private int screenW = 0;
     private int screenH = 0;
@@ -140,7 +149,9 @@ public class SkipAccessibilityService extends AccessibilityService {
 
         if (watchPkg == null) return;
         if (now > watchDeadline) {
-            endWatch(false);
+            // 超时收工：这里也算「自然超时」，要让 endWatch 有机会抓诊断快照。
+            // （早先传 false 会导致只要由事件路径触发超时，诊断就不会被抓。）
+            endWatch(true);
             return;
         }
         // 已经点掉过一次就收工（除非用户要求继续）
@@ -173,10 +184,12 @@ public class SkipAccessibilityService extends AccessibilityService {
         if (r == null || !r.shouldWatch(pkg)) return;
 
         watchPkg = pkg;
+        watchStart = now;
         watchDeadline = now + r.maxWaitMs;
         attempts = 0;
         skippedOnce = false;
         blindTried = false;
+        diagCapturedEarly = false;
         lastScan = 0L;
         lastScanReason = null;
         updateScreenSize();
@@ -186,9 +199,13 @@ public class SkipAccessibilityService extends AccessibilityService {
     }
 
     private void endWatch(boolean timedOut) {
-        // 超时且一直没命中，且用户开了诊断，就抓一份窗口树快照
-        if (timedOut && !skippedOnce && RuleStore.isDiagnose(this) && watchPkg != null) {
-            captureDiagnostic(watchPkg);
+        // 超时且一直没命中，且还没在早期抓过快照时，补抓一份。
+        // （正常情况下 doScan 早已在广告还在屏幕上时抓过了；
+        //   这里是兜底，比如界面一直没内容变化事件、早期那几秒没扫到。）
+        if (timedOut && !skippedOnce && !diagCapturedEarly
+                && RuleStore.isDiagnose(this) && watchPkg != null) {
+            diagCapturedEarly = true;
+            captureDiagnostic(watchPkg, false);
         }
         watchPkg = null;
         handler.removeCallbacks(scanTask);
@@ -304,6 +321,17 @@ public class SkipAccessibilityService extends AccessibilityService {
 
         if (best == null) {
             lastScanReason = "未命中（窗口: " + winInfo + "）";
+
+            // 抓诊断快照：趁广告还在屏幕上时抓，而不是等 15 秒超时。
+            // 开屏广告一般只显示 3~5 秒，等超时抓到的只会是 App 主界面。
+            // 条件：开了诊断、本次还没抓过、已经过 400ms（等广告渲染出来）、
+            //       且还在前 6 秒内（超过就认为是正常界面了）。
+            if (!diagCapturedEarly && RuleStore.isDiagnose(this)
+                    && (now - watchStart) >= 400L && (now - watchStart) <= 6000L) {
+                diagCapturedEarly = true;
+                captureDiagnostic(watchPkg, true);
+            }
+
             // 盲点兜底：实在找不到候选时，按用户设定盲点一次
             if (!blindTried && r.blindTapEnabled && attempts < r.retryLimit) {
                 blindTried = true;
@@ -370,13 +398,18 @@ public class SkipAccessibilityService extends AccessibilityService {
      * 抓一份当前所有可见窗口的文字节点摘要，存到诊断记录里。
      * 用途：某个 App 跳不掉时，把它的开屏界面文字全部记下来，
      * 用户照着把真正的按钮文字加进 skipTexts 即可。
+     *
+     * @param early true 表示这是「开屏早期」抓的（广告还在屏幕上，最有价值）；
+     *              false 表示是超时兜底抓的（多半已是 App 主界面，仅供参考）
      */
-    private void captureDiagnostic(String pkg) {
+    private void captureDiagnostic(String pkg, boolean early) {
         StringBuilder sb = new StringBuilder();
         try {
             sb.append("包名: ").append(pkg).append('\n');
             sb.append("时间: ").append(
                     new SimpleDateFormat("MM-dd HH:mm:ss", Locale.CHINA).format(new Date())).append('\n');
+            sb.append("时机: ").append(early ? "开屏早期（广告应该还在屏幕上）" : "超时兜底（可能已进入主界面）")
+              .append("，距启动 ").append(android.os.SystemClock.uptimeMillis() - watchStart).append(" ms\n");
 
             List<AccessibilityWindowInfo> wins = getWindows();
             int idx = 0;

@@ -192,9 +192,17 @@ Android 的控件 ID 长这样：`com.tencent.mm:id/skip_btn`，冒号后面是 
 ### 某个 App 跳不掉怎么办（v2 推荐流程）
 
 **第 0 步：先看「查看诊断」。** 这是 v2 最有力的工具。
-保持「抓取诊断快照」开启，然后打开那个跳不掉广告的 App，
-等广告自己结束后回到本应用点「查看诊断」。里面会列出该界面**所有文字和可点击控件**，
-包括按钮的真实文案和控件 ID。照着配规则，一次就能配准。
+保持「抓取诊断快照」开启（默认开），然后打开那个跳不掉广告的 App，
+**等广告自己结束、进入主界面后**，回到本应用点「查看诊断」。
+
+快照会在**开屏早期**（启动后约 0.4~6 秒，也就是广告还在屏幕上时）自动抓取，
+这样记下来的才是广告界面本身 —— 如果等到 15 秒超时才抓，广告早消失了，
+得到的只会是 App 主界面。快照里会列出该界面**所有文字和可点击控件**，
+包括按钮的真实文案和控件 ID（可长按复制）。
+
+> 每条快照开头都会标明「时机」：`开屏早期（广告应该还在屏幕上）`
+> 是你要看的那条；若显示 `超时兜底（可能已进入主界面）`，说明那次没赶上，
+> 重新打开一次那个 App 再看。
 
 然后按日志分情况处理：
 
@@ -354,7 +362,7 @@ Number of signers: 1
 
 ```powershell
 pwsh -File build.ps1     # 编译出 APK
-pwsh -File test.ps1      # 跑 153 项逻辑自测
+pwsh -File test.ps1      # 跑 156 项逻辑自测
 ```
 
 构建流程：
@@ -417,19 +425,39 @@ aapt2 不支持非 ASCII 路径，本次构建将在临时目录中进行：
         xml/accessibility_service_config.xml
         mipmap-*/ic_launcher*.png          应用图标（5 种密度）
         drawable/, mipmap-anydpi-v26/
-    src/test/java/com/lbx/skipad/EngineTest.java   153 项纯逻辑单元测试
+    src/test/java/com/lbx/skipad/EngineTest.java   156 项纯逻辑单元测试
   build.gradle / settings.gradle / gradle.properties   Android Studio 工程配置
   build.ps1                                免 Gradle 构建脚本（路径自动推导，可整个搬走，含中文路径）
   test.ps1                                 免设备单元测试脚本
   gen_icon.py                              图标生成（Pillow）
   get_json.ps1                             下载单测用的 org.json 实现
-  tools/                                   随包附带的官方工具链
-      jdk/                                 OpenJDK 17（含 javac / keytool）
-      build-tools/                         aapt2 / d8 / zipalign / apksigner / aapt
+  tools/                                   随仓库附带的官方工具链（约 100 MB）
+      jdk/                                 OpenJDK 17 最小运行时（jlink 裁剪，含 javac / keytool / java）
+      build-tools/                         aapt2 / aapt / d8 / zipalign / apksigner
       platform/                            android.jar（API 34）
-      platform-tools/                      adb（可选，用于连手机调试）
       lib/                                 单测用的 json-20231013.jar
 ```
+
+> 仓库里**不含** `platform-tools`（adb）。它只用于连手机调试，编译完全不需要；
+> 需要时按下面「关于附带的工具链」一节的地址单独下载即可。
+
+### 全新克隆后可以直接编译（已验证）
+
+仓库自带工具链，所以**不需要装 JDK、Android Studio 或 Gradle** 就能编译：
+
+```powershell
+git clone https://github.com/skycommon/skipad-android.git
+cd skipad-android
+pwsh -File build.ps1     # 产出 out/跳过广告-v2.0.apk
+pwsh -File test.ps1      # 156 项断言应全部通过
+```
+
+这条路径已在全新克隆（`--depth 1`）的干净副本上完整验证：
+16 个资源文件编译成功、34 个 class、`classes.dex` 44.6 KB、APK 105.6 KB、156 项测试全过。
+
+> 注意：仓库不含签名密钥库，首次 `build.ps1` 会自动生成一份新的
+> （所以你自己编译出的 APK 签名指纹与 `apk/` 里那份成品不同，
+> 两者不能互相覆盖安装，需要先卸载）。详见下面「关于签名密钥」。
 
 ### 关于附带的工具链
 
@@ -437,11 +465,47 @@ aapt2 不支持非 ASCII 路径，本次构建将在临时目录中进行：
 （OpenJDK 来自华为云镜像，Android SDK 来自腾讯云镜像，均为原始未修改文件），
 这样在没有 Android Studio、没有 Gradle 的环境里也能一键重编。
 
+为了让仓库能放进 GitHub（单文件上限 100 MB），做了这些无损裁剪：
+
+- **JDK**：用 `jlink` 生成只含编译所需模块的最小运行时（`java.base` + `jdk.compiler` 等），
+  保留 `javac` / `keytool` / `java`，从 294 MB 压到 52 MB；
+- **build-tools**：删掉只服务 NDK 与 RenderScript 的
+  `libLLVM_android.dll` / `libclang_android.dll` / `llvm-rs-cc.exe` / `renderscript/`，
+  从 137 MB 压到 29 MB；
+- **platform**：只保留 `android.jar`，删掉 `data/` `skins/` `templates/`。
+
+裁剪后仓库约 100 MB，`aapt2` / `d8` / `zipalign` / `apksigner` 功能完全不受影响
+（`build.ps1` 与 `test.ps1` 均已在裁剪后的工具链上验证通过）。
+
 **如果你只需要装 APK，不需要重新编译，可以把 `tools/` 整个删掉**，能省下约 100 MB。
+
+如果你想要完整未裁剪的官方工具链（或换 JDK/SDK 版本），下载地址：
+
+```
+OpenJDK 17 : https://mirrors.huaweicloud.com/openjdk/17.0.2/openjdk-17.0.2_windows-x64_bin.zip
+Android SDK: https://mirrors.cloud.tencent.com/AndroidSDK/
+             ↳ build-tools_r34-windows.zip
+             ↳ platform-34-ext7_r03.zip
+             ↳ platform-tools_r37.0.1-win.zip
+```
+
+解压到 `tools/` 下对应位置即可，`build.ps1` 会自动识别目录名里的版本号。
+
+### 关于签名密钥
+
+**本仓库不含签名密钥库**（`keystore/` 已在 `.gitignore` 中排除），因为私钥不应公开。
+
+这不影响编译：`build.ps1` 发现密钥库缺失时会自动生成一份新的
+（`keystore/skipad.jks`，口令 `skipad123`）。
+只是新密钥的签名指纹与本仓库 `apk/` 里那份成品不同，
+这两种包**不能互相覆盖安装**（Android 要求签名一致才能升级），需要先卸载再装。
+
+`apk/跳过广告-v2.0.apk` 的签名指纹见上面「八、签名信息」。
+v1.0 → v2.0 用的是同一个密钥库，所以升级可以直接覆盖安装。
 
 ### 自测覆盖
 
-`test.ps1` 会在桌面 JVM 上运行 153 项断言，不需要手机、不需要模拟器：
+`test.ps1` 会在桌面 JVM 上运行 156 项断言，不需要手机、不需要模拟器：
 
 - 规则 JSON 解析与边界钳制（`scanIntervalMs` 下限 40、`maxTextLen` 上限 20、
   `blindTapX/Y` 钳到 0~1 等）

@@ -1,5 +1,7 @@
 package com.lbx.skipad;
 
+import android.view.accessibility.AccessibilityNodeInfo;
+
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -252,6 +254,21 @@ public class EngineTest {
         onlyBad.add(huge);
         check("全部低于阈值 -> null", SkipEngine.pickBest(onlyBad) == null);
         check("空列表 -> null", SkipEngine.pickBest(new ArrayList<SkipEngine.Cand>()) == null);
+
+        System.out.println("== v2 findBest 边界 ==");
+        check("roots=null -> null",
+                SkipEngine.findBest(null, null, r, "com.tencent.qqmusic") == null);
+        check("roots 为空 -> null",
+                SkipEngine.findBest(new ArrayList<AccessibilityNodeInfo>(),
+                        new ArrayList<int[]>(), r, "com.tencent.qqmusic") == null);
+        // 注意：collect 的节点预算必须只由 budget 控制。
+        // 若再引入独立的 seen 计数器并与 budget 比较（seen++ 且 budget--），
+        // 二者之和恒定，扫描会提前一半结束。这里用大量 null 根节点
+        // 间接确认循环不会异常（null 会被 continue 跳过且不消耗栈）。
+        List<AccessibilityNodeInfo> nulls = new ArrayList<AccessibilityNodeInfo>();
+        for (int i = 0; i < 5; i++) nulls.add(null);
+        check("roots 全为 null -> null",
+                SkipEngine.findBest(nulls, null, r, "com.tencent.qqmusic") == null);
 
         System.out.println("== v2 matchKind ==");
         eq("精确匹配返回 2", SkipEngine.matchKind("跳过广告", r, texts, strong), 2);
