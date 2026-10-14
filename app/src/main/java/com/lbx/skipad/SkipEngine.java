@@ -5,6 +5,7 @@ import android.accessibilityservice.GestureDescription;
 import android.graphics.Path;
 import android.graphics.Rect;
 import android.view.accessibility.AccessibilityNodeInfo;
+import android.view.accessibility.AccessibilityWindowInfo;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -37,6 +38,10 @@ final class SkipEngine {
     private static final int CLICK_PROBE_UP = 3;
     /** 面积超过屏幕这个比例的节点视为广告容器，不做候选。 */
     private static final double MAX_AREA_RATIO = 0.55;
+    /** 点击前复核时允许的位置漂移（像素）。 */
+    private static final int TAP_TOLERANCE_PX = 8;
+    /** 复核坐标命中时向下搜索的层数上限。 */
+    private static final int MAX_TAP_SEARCH_DEPTH = 40;
 
     // ------------------------------------------------------------------ 打分权重
     // 全部是纯常量，配合 Cand 里的纯数据字段，可以在桌面 JVM 上直接单测。
@@ -79,6 +84,27 @@ final class SkipEngine {
         double ny = 0.5;
         /** 是否含数字（倒计时，如"跳过5"）。 */
         boolean hasDigit;
+
+        /**
+         * v3.0 稳健模式判定结果：这个候选是否「安全可点」。
+         *
+         * 抖音的「跳过」在右上角，而主页**搜索图标也在右上角**，位置高度重合。
+         * 仅靠文字/ID 无法可靠区分，所以由 RuleStore.Rules.isSafeCandidate()
+         * 再加一层「小而靠边」的形状约束：太大、或落在屏幕正中的都不算安全。
+         * 默认 false，由 collect() 按规则判定后置位 —— 这样万一漏设，
+         * 结果是「不点」而不是「乱点」。
+         */
+        boolean safe;
+
+        /**
+         * 是否由**文字**命中（而不是只靠控件 ID）。
+         *
+         * 稳健模式下要求候选必须有文字依据：跳过按钮上写着「跳过 / 跳过广告 / 跳过5」，
+         * 而抖音主页的搜索图标通常是**纯图标**（没有文字，或只有 contentDescription
+         * 写着"搜索"）。仅靠 `*:*skip*` 这种 ID 规则更容易误伤，所以稳健模式下
+         * 不给纯 ID 候选点击机会。
+         */
+        boolean textHit;
 
         /** 综合打分。纯函数，不碰 node。 */
         int score() {
@@ -344,6 +370,11 @@ final class SkipEngine {
                     }
                     c.clickableDepth = clickableDepthOf(n);
 
+                    // v3.0：稳健模式下按「文字依据 + 形状 + 位置」判定是否安全可点
+                    c.textHit = kind > 0;
+                    c.safe = r.isSafeCandidate(areaRatio, c.ny)
+                            && (!r.safeMode || c.textHit);
+
                     String shown = !txt.isEmpty() ? txt : desc;
                     if (byId) {
                         c.reason = "控件ID " + shortId(viewId)
@@ -371,14 +402,25 @@ final class SkipEngine {
         }
     }
 
-    /** 从候选里挑分最高的；低于 MIN_SCORE 返回 null。 */
+    /**
+     * 从候选里挑分最高的；低于 MIN_SCORE 返回 null。
+     *
+     * v3.0：若存在「安全」候选，就只在安全候选里挑；一个都没有时，
+     * 才退而返回分最高的不安全候选（由调用方决定拦下并记日志）。
+     * 这样既能保持诊断可见性，又不会因为一个高分的不安全候选
+     * 而把一个真正可用的安全候选挤掉。
+     */
     static Cand pickBest(List<Cand> cands) {
-        Cand best = null;
+        Cand bestSafe = null;
+        Cand bestAny = null;
         for (Cand c : cands) {
             if (c.score() < MIN_SCORE) continue;
-            if (best == null || c.score() > best.score()) best = c;
+            if (bestAny == null || c.score() > bestAny.score()) bestAny = c;
+            if (c.safe) {
+                if (bestSafe == null || c.score() > bestSafe.score()) bestSafe = c;
+            }
         }
-        return best;
+        return bestSafe != null ? bestSafe : bestAny;
     }
 
     /**
@@ -415,20 +457,29 @@ final class SkipEngine {
     // ------------------------------------------------------------------ 点击
 
     /**
-     * 点击「跳过」所在的位置。
+     * 点击「跳过」所在的位置（v3.0 加固）。
      *
      * 顺序刻意如此，是为了避免点进广告：
      * 很多开屏页里整个广告容器都是可点击的（点了就跳转广告落地页），
      * 而「跳过」文字只是它的子节点。若一上来就往上找可点击祖先，
      * 很可能点到广告本身，所以优先用文字节点自己的坐标精准点击。
-     *  1) 节点自身可点击 -> ACTION_CLICK
-     *  2) 节点自身有有效坐标 -> 在它中心做坐标点击（最精准）
-     *  3) 都没有 -> 再逐层向上找可点击祖先 -> ACTION_CLICK / 坐标点击
+     *
+     * v3.0 的一处关键修改：**优先用 ACTION_CLICK，而不是坐标手势。**
+     * `dispatchGesture` 是异步的 —— 手势真正落下时，屏幕内容可能已经变了
+     * （开屏页切到主界面）。此时同一坐标上正好出现了别的东西
+     * （抖音右上角的搜索图标就在「跳过」原来的位置），于是就被点中了。
+     * ACTION_CLICK 是直接作用在那个节点上的，不受这种位移影响。
+     * 所以：
+     *  1) 节点自身可点击 -> ACTION_CLICK（首选，最安全）
+     *  2) 节点自身有有效坐标 -> 用【复核过的】坐标点击（见 tapVerified）
+     *  3) 都没有 -> 向上找可点击祖先 -> ACTION_CLICK
+     * 注意：v3.0 不再对祖先做坐标兜底点击 —— 盲点祖先的误触代价太大。
      */
     @SuppressWarnings("deprecation")
-    static boolean clickNode(AccessibilityService svc, AccessibilityNodeInfo n) {
+    static boolean clickNode(AccessibilityService svc, AccessibilityNodeInfo n, boolean verify) {
         if (n == null) return false;
 
+        // 1) 首选：直接对该节点执行 ACTION_CLICK
         try {
             if (n.isClickable() && n.isEnabled()
                     && n.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
@@ -437,8 +488,11 @@ final class SkipEngine {
         } catch (Throwable ignored) {
         }
 
-        if (hasBounds(n) && tap(svc, n)) return true;
+        // 2) 次选：坐标点击自身（verify 为真时先复核目标仍原位）
+        boolean tapped = verify ? tapVerified(svc, n) : (hasBounds(n) && tap(svc, n));
+        if (tapped) return true;
 
+        // 3) 兜底：向上找可点击祖先，并直接对祖先 ACTION_CLICK
         AccessibilityNodeInfo t = n;
         for (int i = 0; i < MAX_ANCESTOR_UP && t != null; i++) {
             AccessibilityNodeInfo parent = null;
@@ -454,8 +508,140 @@ final class SkipEngine {
                 }
             } catch (Throwable ignored) {
             }
-            if (hasBounds(parent) && tap(svc, parent)) return true;
             t = parent;
+        }
+        return false;
+    }
+
+    /**
+     * 点击前复核：目标节点在**此刻**是否仍然真实存在于屏幕上的那个位置。
+     *
+     * 开屏广告消失得很快，而 dispatchGesture 从发出到真正落下有延迟。
+     * 如果在这段间隙里界面已经切换，同一坐标上可能已经是另一个控件
+     * （抖音的搜索图标就常出现在「跳过」原来的位置），于是造成误触。
+     *
+     * 复核方式：
+     *   · 节点必须仍然 attached、enabled、可见；
+     *   · 它的屏幕矩形必须与刚才一致（容差 8px）；
+     *   · 该坐标处实际存在的节点，必须与它就是同一个（或其后代）。
+     * 任何一条不满足就放弃 —— 宁可漏跳，不可误触。
+     */
+    @SuppressWarnings("deprecation")
+    static boolean tapVerified(AccessibilityService svc, AccessibilityNodeInfo n) {
+        Rect r0 = new Rect();
+        try {
+            n.getBoundsInScreen(r0);
+        } catch (Throwable t) {
+            return false;
+        }
+        if (r0.width() <= 0 || r0.height() <= 0) return false;
+
+        boolean ok = stillSameNode(svc, n, r0);
+        if (!ok) return false;
+
+        float x = r0.exactCenterX();
+        float y = r0.exactCenterY();
+        return tapAt(svc, x, y);
+    }
+
+    /**
+     * 确认节点此刻仍然在原位，且那个坐标上确实还是它。
+     * 独立出来是为了可读性与可测性（只依赖少量 Android API）。
+     */
+    @SuppressWarnings("deprecation")
+    static boolean stillSameNode(AccessibilityService svc, AccessibilityNodeInfo n, Rect expect) {
+        try {
+            if (!n.isEnabled()) return false;
+        } catch (Throwable ignored) {
+            return false;
+        }
+
+        Rect now = new Rect();
+        try {
+            n.getBoundsInScreen(now);
+        } catch (Throwable t) {
+            return false;
+        }
+        // 位置变了说明界面已经重排，放弃
+        if (Math.abs(now.left - expect.left) > TAP_TOLERANCE_PX
+                || Math.abs(now.top - expect.top) > TAP_TOLERANCE_PX
+                || Math.abs(now.right - expect.right) > TAP_TOLERANCE_PX
+                || Math.abs(now.bottom - expect.bottom) > TAP_TOLERANCE_PX) {
+            return false;
+        }
+
+        // 该坐标处当前实际存在的节点，必须就是它（或它的后代）
+        try {
+            List<AccessibilityWindowInfo> wins = svc.getWindows();
+            if (wins == null) return false;
+            int cx = now.centerX();
+            int cy = now.centerY();
+            for (AccessibilityWindowInfo w : wins) {
+                if (w == null) continue;
+                AccessibilityNodeInfo root = null;
+                try {
+                    root = w.getRoot();
+                } catch (Throwable ignored) {
+                }
+                if (root == null) continue;
+                AccessibilityNodeInfo hit = findNodeAt(root, cx, cy, 0);
+                if (hit != null) {
+                    return isSameOrDescendantOf(hit, n);
+                }
+            }
+            return false;
+        } catch (Throwable t) {
+            // 复核本身出错时保守处理：不点
+            return false;
+        }
+    }
+
+    /** 在窗口树里找位于 (x,y) 的最深层节点。 */
+    @SuppressWarnings("deprecation")
+    private static AccessibilityNodeInfo findNodeAt(AccessibilityNodeInfo n, int x, int y, int depth) {
+        if (n == null || depth > MAX_TAP_SEARCH_DEPTH) return null;
+
+        Rect r = new Rect();
+        try {
+            n.getBoundsInScreen(r);
+        } catch (Throwable t) {
+            return null;
+        }
+        if (!r.contains(x, y)) return null;
+
+        int c = 0;
+        try {
+            c = n.getChildCount();
+        } catch (Throwable ignored) {
+        }
+        for (int i = c - 1; i >= 0; i--) {
+            AccessibilityNodeInfo ch = null;
+            try {
+                ch = n.getChild(i);
+            } catch (Throwable ignored) {
+            }
+            if (ch == null) continue;
+            AccessibilityNodeInfo deeper = findNodeAt(ch, x, y, depth + 1);
+            if (deeper != null) return deeper;
+        }
+        return n;
+    }
+
+    /** a 是否就是 b，或者 b 的后代。 */
+    @SuppressWarnings("deprecation")
+    private static boolean isSameOrDescendantOf(AccessibilityNodeInfo a, AccessibilityNodeInfo b) {
+        if (a == null || b == null) return false;
+        if (a.equals(b)) return true;
+        AccessibilityNodeInfo t = a;
+        for (int i = 0; i < MAX_ANCESTOR_UP + 4 && t != null; i++) {
+            AccessibilityNodeInfo p = null;
+            try {
+                p = t.getParent();
+            } catch (Throwable ignored) {
+            }
+            if (p == null) return false;
+            if (p.equals(b)) return true;
+            t = p;
         }
         return false;
     }

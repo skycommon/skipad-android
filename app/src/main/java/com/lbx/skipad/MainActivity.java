@@ -93,7 +93,7 @@ public class MainActivity extends android.app.Activity {
         root.addView(t);
 
         TextView s = new TextView(this);
-        s.setText("v2.1 · 多窗口扫描 · 本地运行 · 不联网");
+        s.setText("v3.0 · 防误触 · 多窗口扫描 · 本地运行 · 不联网");
         s.setTextSize(13);
         s.setTextColor(C_SUB);
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
@@ -202,11 +202,36 @@ public class MainActivity extends android.app.Activity {
 
         card.addView(divider());
 
+        // 稳健模式：v3.0 起默认开启，是防误触的主力开关。
+        card.addView(switchRow("稳健模式（推荐开启）",
+                "只在小按钮、且位于屏幕顶部/底部、且有文字依据时才点；宁可不跳也不误触",
+                isSafeMode(), new OnChecked() {
+                    @Override
+                    public void onChecked(boolean v) {
+                        setGlobalBool("safeMode", v);
+                        refreshStatus();
+                    }
+                }));
+
+        card.addView(divider());
+
         card.addView(switchRow("抓取诊断快照", "跳不掉时记下当前界面文字，便于排查",
                 RuleStore.isDiagnose(this), new OnChecked() {
                     @Override
                     public void onChecked(boolean v) {
                         RuleStore.setDiagnose(MainActivity.this, v);
+                    }
+                }));
+
+        card.addView(divider());
+
+        card.addView(switchRow("点击前复核位置",
+                "防止广告消失后，点击落到同一位置新出现的图标上（如抖音的搜索）",
+                isVerifyBeforeTap(), new OnChecked() {
+                    @Override
+                    public void onChecked(boolean v) {
+                        setGlobalBool("verifyBeforeTap", v);
+                        refreshStatus();
                     }
                 }));
 
@@ -578,6 +603,28 @@ public class MainActivity extends android.app.Activity {
             return g != null && g.optBoolean("blindTapEnabled", false);
         } catch (Throwable t) {
             return false;
+        }
+    }
+
+    /** 稳健模式（默认开）。关掉后不再限制候选的大小与位置，误触风险显著上升。 */
+    private boolean isSafeMode() {
+        try {
+            JSONObject root = new JSONObject(RuleStore.getRawJson(this));
+            JSONObject g = root.optJSONObject("global");
+            return g == null || g.optBoolean("safeMode", true);
+        } catch (Throwable t) {
+            return true;
+        }
+    }
+
+    /** 点击前是否复核目标仍在原位（默认开）。 */
+    private boolean isVerifyBeforeTap() {
+        try {
+            JSONObject root = new JSONObject(RuleStore.getRawJson(this));
+            JSONObject g = root.optJSONObject("global");
+            return g == null || g.optBoolean("verifyBeforeTap", true);
+        } catch (Throwable t) {
+            return true;
         }
     }
 

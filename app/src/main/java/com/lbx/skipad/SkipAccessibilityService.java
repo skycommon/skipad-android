@@ -71,6 +71,18 @@ public class SkipAccessibilityService extends AccessibilityService {
     private boolean diagCapturedEarly = false;
     /** 是否已排入一次主动轮询。 */
     private boolean pollScheduled = false;
+
+    // ---------------- v3.0 防误触状态 ----------------
+
+    /** 上一次认定的前台应用包名，用于区分「真切换应用」和「应用内换界面」。 */
+    private String lastFgPkg = null;
+    /** 上一次观察的是哪个应用。 */
+    private String lastEpisodePkg = null;
+    /** 上一次观察结束的时刻（uptimeMillis）。 */
+    private long lastEpisodeEndMs = 0L;
+    /** 自上次观察结束后，是否出现过系统窗口（桌面/设置等）——说明用户真的离开过。 */
+    private boolean sawSystemSinceEpisode = false;
+
     /** 屏幕尺寸缓存。 */
     private int screenW = 0;
     private int screenH = 0;
@@ -210,20 +222,31 @@ public class SkipAccessibilityService extends AccessibilityService {
         RuleStore.Rules r = rules;
         if (r == null) return;
 
-        // 决策抽成了纯函数（RuleStore.Rules.decideForeground），便于单测覆盖：
-        //   FG_SAME   同一应用内切界面 -> 不动
-        //   FG_KEEP   新包名无需监听（桌面/设置/系统UI/广告SDK）-> 保留观察，继续等广告
-        //   FG_SWITCH 切到另一个需监听的应用 -> 结束旧观察，改监听它
-        //   FG_START  当前没在观察，新应用需监听 -> 开始监听
-        //   FG_IGNORE 当前没在观察，新应用也无需监听 -> 不动
-        //
-        // 这里修掉的是「有时能跳、有时跳不掉」：原实现不判包名一律 endWatch，
-        // 任何无关的窗口状态变化都会掐断观察，广告往往在掐断后才渲染出来。
-        int action = r.decideForeground(pkg, watchPkg);
+        // 决策已抽成纯函数（RuleStore.Rules.decideForeground），便于单测覆盖。
+        // v3.0 的两个防误触要点都体现在这里：
+        //   · 观察一旦开始就**锚定**在原应用上，任何其它包名（含广告 SDK 窗口）
+        //     都不接管、不重启 —— 避免把观察窗口拖到正常界面上；
+        //   · 区分「真切换应用」与「同应用内换界面」，后者在没在观察时一律忽略
+        //     —— 避免开完全屏搜索又被重新扫一轮。
+        RuleStore.Rules.FgContext ctx = new RuleStore.Rules.FgContext();
+        ctx.watchingPkg = watchPkg;
+        ctx.lastFgPkg = lastFgPkg;
+        ctx.lastEpisodePkg = lastEpisodePkg;
+        ctx.lastEpisodeEndMs = lastEpisodeEndMs;
+        ctx.sawSystemSinceEpisode = sawSystemSinceEpisode;
+        ctx.now = now;
+
+        int action = r.decideForeground(pkg, ctx);
+
+        // 记录「见过系统窗口」，供冷却判断使用（用户回过桌面=确实离开过该应用）
+        if (!pkg.equals(watchPkg) && !r.shouldWatch(pkg)) {
+            sawSystemSinceEpisode = true;
+        }
+        // 更新前台应用记录（在决策之后，因为决策需要用到旧的 lastFgPkg）
+        lastFgPkg = pkg;
 
         if (action == RuleStore.Rules.FG_SAME || action == RuleStore.Rules.FG_IGNORE
                 || action == RuleStore.Rules.FG_KEEP) {
-            // 同一应用内切界面 / 无需监听 / 广告SDK等窗口打断 —— 都不动当前观察
             return;
         }
 
@@ -233,11 +256,19 @@ public class SkipAccessibilityService extends AccessibilityService {
 
         watchPkg = pkg;
         watchStart = now;
-        watchDeadline = now + r.maxWaitMs;
+        // 观察窗口取「开屏期」和用户配置的 maxWaitMs 中较小者：
+        // 开屏广告只可能出现在应用刚起来的这一小段时间内。
+        long limit = Math.min(r.maxWaitMs, r.safeMode ? r.splashWindowMs : r.maxWaitMs);
+        watchDeadline = now + limit;
         attempts = 0;
         skippedOnce = false;
         blindTried = false;
         diagCapturedEarly = false;
+        // 新一轮观察开始，重置「期间是否回过系统界面」的标记。
+        // 这个标记是给**本轮结束后**的冷却判断用的：必须在这里清掉，
+        // 否则一旦用户回过桌面它就永远是 true，冷却逻辑将永久失效
+        // （表现为同一应用内换界面又会重开观察 —— 正是要修的误触）。
+        sawSystemSinceEpisode = false;
         lastScan = 0L;
         lastScanReason = null;
         updateScreenSize();
@@ -255,6 +286,12 @@ public class SkipAccessibilityService extends AccessibilityService {
                 && RuleStore.isDiagnose(this) && watchPkg != null) {
             diagCapturedEarly = true;
             captureDiagnostic(watchPkg, false);
+        }
+        // 记下这次观察是针对哪个应用、何时结束的，供冷却判断使用
+        // （防止同一应用内很快又被重新开一轮观察，从而在正常界面上乱找按钮）。
+        if (watchPkg != null) {
+            lastEpisodePkg = watchPkg;
+            lastEpisodeEndMs = android.os.SystemClock.uptimeMillis();
         }
         watchPkg = null;
         handler.removeCallbacks(scanTask);
@@ -400,6 +437,27 @@ public class SkipAccessibilityService extends AccessibilityService {
             return;
         }
 
+        // ------------------------------------------------------------------
+        // v3.0 稳健模式的安全闸门。
+        //
+        // 抖音的「跳过」在右上角，而主页的**搜索图标也在右上角**，
+        // 两者位置高度重合；仅靠文字/ID 匹配无法可靠区分。
+        // 所以在真正点击之前，再过一道「形状 + 位置」的硬约束：
+        //   · 必须是**开着稳健模式**时的候选（safeMode 关掉则不拦）；
+        //   · 只能点在屏幕顶部带或底部带内，绝不点屏幕正中（正文/输入区）；
+        //   · 候选面积不能太大。
+        // 宁可漏跳（老年人更容易接受「没跳」而不是「点错」），也不误触。
+        // ------------------------------------------------------------------
+        if (best != null && !best.safe) {
+            lastScanReason = "已拦下不安全候选：" + best.reason
+                    + "（面积" + Math.round(best.areaRatio * 100) + "%，纵位置"
+                    + Math.round(best.ny * 100) + "%）";
+            Log.i(TAG, lastScanReason);
+            // 不点，但也不再重试同一类候选：直接结束本轮，避免反复评估。
+            if (!r.continueAfterSkip) endWatch(false);
+            return;
+        }
+
         if (best == null) {
             lastScanReason = "未命中（窗口: " + winInfo
                     + (skippedWins > 0 ? "，已跳过 " + skippedWins + " 个排除窗口" : "") + "）";
@@ -431,7 +489,7 @@ public class SkipAccessibilityService extends AccessibilityService {
         attempts++;
         boolean ok;
         try {
-            ok = SkipEngine.clickNode(this, best.node);
+            ok = SkipEngine.clickNode(this, best.node, r.verifyBeforeTap);
         } catch (Throwable t) {
             ok = false;
         }

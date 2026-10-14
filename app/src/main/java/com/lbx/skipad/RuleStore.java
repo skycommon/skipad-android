@@ -150,6 +150,25 @@ final class RuleStore {
             // 轮询间隔：即使一个无障碍事件都没有，也要按这个周期主动扫描。
             // 这是「有时能跳、有时不能」的根治手段（原实现纯事件驱动）。
             r.pollIntervalMs = clamp(g.optInt("pollIntervalMs", 250), 80, 2000);
+
+            // ----------------------------------------------------------
+            // v3.0 防误触（默认全开，面向老年用户：宁可漏跳，绝不误触）
+            // ----------------------------------------------------------
+            r.safeMode = g.optBoolean("safeMode", true);
+            // 只在回到前台后的这段时间内才认为是「开屏期」并允许扫描。
+            // 超过就停止，避免在正常界面（如抖音全屏搜索）里乱找按钮。
+            r.splashWindowMs = clamp(g.optInt("splashWindowMs", 6000), 1000, 60000);
+            // 同一应用两次观察之间的冷却时间。防止「观察结束 -> 界面变化 -> 重新开观察」
+            // 这个循环把扫描带进正常界面。
+            r.episodeCooldownMs = clamp(g.optInt("episodeCooldownMs", 60000), 1000, 600000);
+            // 点击前复核目标是否还在原位（防 dispatchGesture 异步导致点击穿透）。
+            r.verifyBeforeTap = g.optBoolean("verifyBeforeTap", true);
+            // 稳健模式下候选按钮的面积上限（占窗口比例）。跳过按钮都很小。
+            r.safeMaxArea = clampDouble(g.optDouble("safeMaxArea", 0.12), 0.01, 1.0);
+            // 稳健模式下的「安全带」：只在屏幕顶部/底部这条带内点击，
+            // 屏幕中部通常是正文/输入区，点错代价大。
+            r.safeTopBand = clampDouble(g.optDouble("safeTopBand", 0.30), 0.05, 0.6);
+            r.safeBottomBand = clampDouble(g.optDouble("safeBottomBand", 0.75), 0.4, 0.99);
         }
 
         r.skipTexts = toList(root.optJSONArray("skipTexts"));
@@ -221,6 +240,41 @@ final class RuleStore {
         /** 主动轮询间隔（毫秒）。即使没有任何无障碍事件，也按此周期扫描。 */
         int pollIntervalMs = 250;
 
+        // ---------------- v3.0 防误触 ----------------
+
+        /**
+         * 稳健模式（默认开）。面向「宁可不跳，也不要点错」的场景（如老年用户）。
+         * 开启后会额外限制：候选必须小、必须落在安全带内、必须来自开屏期。
+         */
+        boolean safeMode = true;
+        /** 开屏期时长（毫秒）：只在这段时间内才允许扫描点击。 */
+        int splashWindowMs = 6000;
+        /** 同一应用两次观察之间的冷却（毫秒），防止把扫描带进正常界面。 */
+        int episodeCooldownMs = 60000;
+        /** 点击前复核目标仍在其原位置（防异步点击穿透）。 */
+        boolean verifyBeforeTap = true;
+        /** 稳健模式下允许的最大候选面积占比。 */
+        double safeMaxArea = 0.12;
+        /** 稳健模式的安全带：只有落在这两条归一化纵坐标之间才允许点击。 */
+        double safeTopBand = 0.30;
+        double safeBottomBand = 0.75;
+
+        /**
+         * 判断某个候选在稳健模式下是否安全可点。
+         *
+         * 为什么需要它：抖音的「跳过」在右上角，而主页的**搜索图标也在右上角**，
+         * 两者位置高度重合。仅靠文字/ID 匹配无法可靠区分，
+         * 所以再加一层「形状与位置」的约束 —— 跳过按钮一定是小控件，
+         * 且出现在屏幕顶部或底部，绝不落在正中央（那里是正文/输入区）。
+         */
+        boolean isSafeCandidate(double areaRatio, double ny) {
+            if (!safeMode) return true;
+            // 太大的一律不要（跳过按钮都是小的）
+            if (areaRatio > 0 && areaRatio > safeMaxArea) return false;
+            // 必须落在顶部带或底部带内
+            return ny <= safeTopBand || ny >= safeBottomBand;
+        }
+
         List<String> skipTexts = new ArrayList<String>();
         List<String> strongTexts = new ArrayList<String>();
         List<String> denyTexts = new ArrayList<String>();
@@ -255,34 +309,88 @@ final class RuleStore {
         }
 
         /**
-         * 收到「前台应用变了」事件时该怎么办。
+         * 收到「前台应用变了」事件时的决策上下文。
          *
-         * 这是「有时能跳、有时跳不掉」的根因落点，逻辑很容易写错，
-         * 所以抽成一个纯函数，把四种情况显式区分开并单独测：
-         *
-         *  - 原实现：不判包名直接 endWatch()，于是**任何**窗口状态变化都会掐断观察
-         *    （包括切到桌面、系统窗口上报等）。广告往往在观察被掐断之后才渲染出来，
-         *    能不能跳就全看这些无关事件有没有恰好插进来 —— 表现为时灵时不灵。
-         *  - 但也不能矫枉过正：没在观察时必须能**开始**观察，
-         *    否则切进 App 时 watchPkg 为 null，就永远开不了监听。
+         * 把这些状态显式传进来（而不是藏在 Service 的字段里），
+         * 是为了让整套防误触逻辑能在桌面 JVM 上直接单测 ——
+         * 误触问题靠读代码很难验证，但可以断言。
          */
-        int decideForeground(String pkg, String watchingPkg) {
-            if (pkg == null || pkg.isEmpty()) return FG_IGNORE;
-            if (pkg.equals(watchingPkg)) return FG_SAME;          // 同一应用内切界面
-            if (watchingPkg != null) {
-                // 正在观察中：只有切到另一个「需要监听」的应用才结束旧观察；
-                // 其它包名（桌面/设置/系统UI/广告SDK）一律保留观察，继续等广告。
-                return shouldWatch(pkg) ? FG_SWITCH : FG_KEEP;
-            }
-            // 没在观察：新应用需要监听就开始，否则忽略
-            return shouldWatch(pkg) ? FG_START : FG_IGNORE;
+        static final class FgContext {
+            /** 当前正在观察（监听开屏）的应用；null 表示没在观察。 */
+            String watchingPkg;
+            /** 上一次认定的「前台应用」包名（用于判断是否真的发生了应用切换）。 */
+            String lastFgPkg;
+            /** 上一次观察的是哪个应用。 */
+            String lastEpisodePkg;
+            /** 上一次观察结束的时刻（uptimeMillis）。 */
+            long lastEpisodeEndMs;
+            /** 自上次观察结束后，是否出现过桌面/系统窗口（说明用户真的离开过该应用）。 */
+            boolean sawSystemSinceEpisode;
+            /** 当前时刻（uptimeMillis）。 */
+            long now;
         }
 
-        static final int FG_SAME = 0;    // 同一应用，什么都不做
-        static final int FG_KEEP = 1;    // 保留当前观察（新包名无需监听）
-        static final int FG_SWITCH = 2;  // 结束旧观察，改监听新应用
+        /**
+         * 收到「前台应用变了」事件时该怎么办。v3.0 重写。
+         *
+         * 这是 v2.x 里误触的两个根源所在：
+         *
+         *  误触 1「打开抖音误触右上角搜索」：
+         *    抖音的「跳过」在右上角，主页搜索图标**也在右上角**，位置高度重合。
+         *    而且开屏广告常由广告 SDK 渲染在**独立窗口**里 —— 那个包名一到，
+         *    v2.1 会把观察「接管」到广告 SDK 包上；等广告消失、抖音主界面回来时，
+         *    又被当成一次新的前台切换，于是**在正常界面上重新开了一个观察窗口**，
+         *    就去点搜索图标了。
+         *    修法：观察一旦开始就**锚定**在那个应用上，任何其它包名都不接管、不重启
+         *    （见下面的 FG_KEEP 分支）。反正我们是遍历全部窗口扫描的，
+         *    广告窗口照样能被扫到，根本不需要换锚点。
+         *
+         *  误触 2「打开全屏搜索也会误触」：
+         *    v2.1 观察结束（endWatch 清空 watchingPkg）后，
+         *    同一应用内的任何窗口变化都会被判成 FG_START 而**重新开始观察**。
+         *    修法：区分「真正切换了应用」和「同一应用内部换界面」——
+         *    后者（pkg == lastFgPkg）在没在观察时一律 FG_IGNORE。
+         */
+        int decideForeground(String pkg, FgContext ctx) {
+            if (pkg == null || pkg.isEmpty()) return FG_IGNORE;
+
+            // 同一应用内切界面：观察中就继续观察；没在观察就什么都别做。
+            if (pkg.equals(ctx.watchingPkg)) return FG_SAME;
+
+            // 前台应用没变（只是同应用内的窗口状态变化）：
+            // 观察中无所谓，没在观察时**绝不能**借此重新开始观察。
+            if (pkg.equals(ctx.lastFgPkg)) {
+                return ctx.watchingPkg != null ? FG_SAME : FG_IGNORE;
+            }
+
+            // ---- 走到这里说明前台应用确实变了 ----
+
+            // 正在观察中：不接管、不重启。继续观察原来那个应用，
+            // 靠多窗口扫描去覆盖广告窗口，避免把观察窗口拖到正常界面上。
+            if (ctx.watchingPkg != null) return FG_KEEP;
+
+            // 没在观察，而且新应用也不需要监听（桌面/设置/系统UI）：
+            // 什么都不做；Service 会记下「见过系统窗口」。
+            if (!shouldWatch(pkg)) return FG_IGNORE;
+
+            // 没在观察，新应用需要监听 —— 但还要过冷却这一关：
+            // 刚从同一个应用观察完、且期间没回过桌面/系统窗口，
+            // 说明这多半只是该应用内部的界面切换（例如从广告页跳到主页），
+            // 不能再来一轮，否则就是在正常界面上乱找按钮。
+            boolean sameAppAgain = pkg.equals(ctx.lastEpisodePkg);
+            boolean withinCooldown = (ctx.now - ctx.lastEpisodeEndMs) < episodeCooldownMs;
+            if (sameAppAgain && withinCooldown && !ctx.sawSystemSinceEpisode) {
+                return FG_IGNORE;
+            }
+
+            return FG_START;
+        }
+
+        static final int FG_SAME = 0;    // 同一应用内变化，什么都不做
+        static final int FG_KEEP = 1;    // 保持当前观察，不接管、不重启
+        static final int FG_SWITCH = 2;  // 结束旧观察，改监听新应用（v3.0 起不再用于自动接管）
         static final int FG_START = 3;   // 当前没在观察，开始监听新应用
-        static final int FG_IGNORE = 4;  // 当前没在观察，新应用也无需监听
+        static final int FG_IGNORE = 4;  // 什么都不做
 
         /** 组合该应用生效的文字规则。 */
         List<String> textsFor(String pkg) {

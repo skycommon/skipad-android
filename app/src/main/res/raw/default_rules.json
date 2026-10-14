@@ -11,7 +11,15 @@
     "continueAfterSkip": false,
     "blindTapEnabled": false,
     "blindTapX": 0.86,
-    "blindTapY": 0.07
+    "blindTapY": 0.07,
+
+    "safeMode": true,
+    "splashWindowMs": 6000,
+    "episodeCooldownMs": 60000,
+    "verifyBeforeTap": true,
+    "safeMaxArea": 0.12,
+    "safeTopBand": 0.30,
+    "safeBottomBand": 0.75
   },
 
   "skipTexts": [
@@ -33,9 +41,7 @@
   "strongTexts": [
     "跳过",
     "关闭广告",
-    "跳过广告",
-    "skipad",
-    "skip"
+    "跳过广告"
   ],
 
   "denyTexts": [
@@ -94,6 +100,15 @@
         "*:*ad*close*",
         "*:*close*ad*"
       ]
+    },
+    "com.ss.android.ugc.aweme": {
+      "name": "抖音",
+      "enabled": true,
+      "extraTexts": [
+        "跳过",
+        "跳过广告"
+      ],
+      "extraIds": []
     }
   }
 }

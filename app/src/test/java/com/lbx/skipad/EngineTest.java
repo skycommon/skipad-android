@@ -289,7 +289,8 @@ public class EngineTest {
         eq("blindTapEnabled 默认关", r.blindTapEnabled, false);
         eq("blindTapX 默认 0.86", r.blindTapX, 0.86);
         eq("blindTapY 默认 0.07", r.blindTapY, 0.07);
-        check("strongTexts 含 skip", r.strongTexts.contains("skip"));
+        // 注意：v2.0 时 strongTexts 含 "skip"/"skipad"，但 v3.0 起刻意移除
+        // （这两个词过宽，会让靠 ID 命中的图标候选也进池，见下方 v3.0 小节）。
         check("QQ音乐有单独配置", r.apps.containsKey("com.tencent.qqmusic"));
         eq("QQ音乐显示名", r.nameOf("com.tencent.qqmusic"), "QQ音乐");
         check("跳过此广告 精确命中",
@@ -333,33 +334,176 @@ public class EngineTest {
         check("包名为 null 不跳过", !r.isExcludedWindow(null, "com.tencent.qqmusic"));
         check("包名为空不跳过", !r.isExcludedWindow("", "com.tencent.qqmusic"));
 
-        System.out.println("== 前台切换决策（decideForeground，五种情况） ==");
+        System.out.println("== v3.0 前台切换决策（decideForeground + FgContext） ==");
         String qq = "com.tencent.qqmusic";
-        // 正在监听 QQ音乐
-        eq("同应用 -> FG_SAME", r.decideForeground(qq, qq), RuleStore.Rules.FG_SAME);
-        eq("切到桌面 -> FG_KEEP", r.decideForeground("com.miui.home", qq), RuleStore.Rules.FG_KEEP);
-        eq("切到系统设置 -> FG_KEEP", r.decideForeground("com.android.settings", qq), RuleStore.Rules.FG_KEEP);
-        eq("切到系统UI -> FG_KEEP", r.decideForeground("com.android.systemui", qq), RuleStore.Rules.FG_KEEP);
-        // 广告 SDK 的包名不在排除名单里，watchAll=true 时它算「可监听」，
-        // 因此走 FG_SWITCH（重开一个观察窗口）。这是可接受的：
-        // 扫描本来就会遍历所有未排除窗口，QQ音乐那扇窗照样会被扫到，
-        // 而重开窗口只是把截止时间往后推，反而更容易等到广告渲染出来。
-        eq("广告SDK窗口 -> FG_SWITCH（无害）",
-                r.decideForeground("com.qq.e.ads", qq), RuleStore.Rules.FG_SWITCH);
-        eq("切到微信 -> FG_SWITCH", r.decideForeground("com.tencent.mm", qq), RuleStore.Rules.FG_SWITCH);
-        // 没在观察时（这是上一版写出过的回归：watchPkg=null 时必须能开始监听）
-        eq("没在观察+需监听应用 -> FG_START", r.decideForeground(qq, null), RuleStore.Rules.FG_START);
-        eq("没在观察+微信 -> FG_START", r.decideForeground("com.tencent.mm", null), RuleStore.Rules.FG_START);
-        eq("没在观察+桌面 -> FG_IGNORE", r.decideForeground("com.miui.home", null), RuleStore.Rules.FG_IGNORE);
-        eq("没在观察+自身 -> FG_IGNORE", r.decideForeground("com.lbx.skipad", null), RuleStore.Rules.FG_IGNORE);
-        eq("空包名 -> FG_IGNORE", r.decideForeground("", qq), RuleStore.Rules.FG_IGNORE);
-        eq("null 包名 -> FG_IGNORE", r.decideForeground(null, qq), RuleStore.Rules.FG_IGNORE);
+        String dy = "com.ss.android.ugc.aweme";
+        String adsdk = "com.bytedance.sdk.openadsdk";
+
+        // 构造上下文的辅助：现在观察的是 watching，上一次前台是 lastFg，
+        // 上一次观察的是 lastEp、结束于 endMs 前，期间是否见过系统窗口。
+        // 用静态方法 ctx(...) 构造，见文件末尾。
+
+        // ---- 观察中：绝不接管、绝不重启（修抖音误触 1） ----
+        eq("同应用 -> FG_SAME", r.decideForeground(qq, ctx(qq, qq, null, 0, 1_000_000L, false, 1_000_000L)),
+                RuleStore.Rules.FG_SAME);
+        // 关键：广告 SDK 窗口到来时不再接管观察（v2.1 会 FG_SWITCH，正是误触根源）
+        eq("观察中+广告SDK窗口 -> FG_KEEP",
+                r.decideForeground(adsdk, ctx(qq, qq, null, 0, 1_000_000L, false, 1_000_000L)),
+                RuleStore.Rules.FG_KEEP);
+        eq("观察中+桌面 -> FG_KEEP",
+                r.decideForeground("com.miui.home", ctx(qq, qq, null, 0, 1_000_000L, false, 1_000_000L)),
+                RuleStore.Rules.FG_KEEP);
+        eq("观察中+另一个应用 -> FG_KEEP（不换锚点）",
+                r.decideForeground("com.tencent.mm", ctx(qq, qq, null, 0, 1_000_000L, false, 1_000_000L)),
+                RuleStore.Rules.FG_KEEP);
+
+        // ---- 同应用内换界面：没在观察时绝不能再开始（修抖音误触 2） ----
+        // 这正是「打开全屏搜索会误触」的场景：lastFg 仍是抖音，只是界面变了。
+        eq("没观察+同应用换界面 -> FG_IGNORE",
+                r.decideForeground(dy, ctx(null, dy, dy, 0, 0L, false, 5_000_000L)),
+                RuleStore.Rules.FG_IGNORE);
+
+        // ---- 没在观察 + 真的切到了另一个需监听应用 -> 可以开始 ----
+        eq("没观察+真切换应用 -> FG_START",
+                r.decideForeground("com.tencent.mm", ctx(null, qq, qq, 0, 0L, false, 5_000_000L)),
+                RuleStore.Rules.FG_START);
+        eq("没观察+首次进入 -> FG_START",
+                r.decideForeground(qq, ctx(null, null, null, 0, 0L, false, 5_000_000L)),
+                RuleStore.Rules.FG_START);
+
+        // ---- 冷却：刚从同一应用观察完、且期间没回过桌面 -> 忽略 ----
+        // 场景：抖音开屏观察结束（超时），紧接着主界面窗口状态变化又来一次。
+        eq("冷却中+同应用 -> FG_IGNORE",
+                r.decideForeground(dy, ctx(null, qq, dy, 5_000L, 10_000L, false, 12_000L)),
+                RuleStore.Rules.FG_IGNORE);
+        // 但若期间真的回过桌面（见过系统窗口），说明是用户重新打开，允许再来一轮
+        eq("冷却中但回过桌面 -> FG_START",
+                r.decideForeground(dy, ctx(null, "com.miui.home", dy, 5_000L, 10_000L, true, 12_000L)),
+                RuleStore.Rules.FG_START);
+        // 冷却时间已过 -> 允许
+        eq("冷却已过 + 同应用 -> FG_START",
+                r.decideForeground(dy, ctx(null, qq, dy, 5_000L, 10_000L, false, 200_000L)),
+                RuleStore.Rules.FG_START);
+
+        // ---- 无需监听的包名 ----
+        eq("没观察+桌面 -> FG_IGNORE",
+                r.decideForeground("com.miui.home", ctx(null, qq, null, 0, 0L, false, 5_000_000L)),
+                RuleStore.Rules.FG_IGNORE);
+        eq("没观察+自身 -> FG_IGNORE",
+                r.decideForeground("com.lbx.skipad", ctx(null, qq, null, 0, 0L, false, 5_000_000L)),
+                RuleStore.Rules.FG_IGNORE);
+        // ---- 空/null ----
+        eq("空包名 -> FG_IGNORE",
+                r.decideForeground("", ctx(qq, qq, null, 0, 0L, false, 5_000_000L)),
+                RuleStore.Rules.FG_IGNORE);
+        eq("null 包名 -> FG_IGNORE",
+                r.decideForeground(null, ctx(qq, qq, null, 0, 0L, false, 5_000_000L)),
+                RuleStore.Rules.FG_IGNORE);
+
+        // ================================================================
+        // v3.0 防误触：稳健模式的安全判定
+        // ================================================================
+        System.out.println("== v3.0 稳健模式安全闸门（isSafeCandidate） ==");
+        RuleStore.Rules safe = RuleStore.parse(
+                "{\"global\":{\"safeMode\":true,\"safeMaxArea\":0.12,"
+                        + "\"safeTopBand\":0.30,\"safeBottomBand\":0.75},"
+                        + "\"skipTexts\":[\"跳过\"],\"strongTexts\":[\"跳过\"]}");
+        eq("safeMode 默认开", r.safeMode, true);
+        eq("splashWindowMs 默认 6000", r.splashWindowMs, 6000);
+        eq("episodeCooldownMs 默认 60000", r.episodeCooldownMs, 60000);
+        eq("verifyBeforeTap 默认开", r.verifyBeforeTap, true);
+        check("safeMaxArea 默认 0.12", Math.abs(r.safeMaxArea - 0.12) < 1e-9);
+
+        // 正常的跳过按钮：小 + 右上角 -> 安全
+        check("小按钮+右上角 -> 安全", safe.isSafeCandidate(0.03, 0.06));
+        // 正常的跳过按钮：小 + 底部 -> 安全
+        check("小按钮+底部 -> 安全", safe.isSafeCandidate(0.04, 0.92));
+        // 顶部带边界内
+        check("顶部带内(0.30) -> 安全", safe.isSafeCandidate(0.05, 0.30));
+        check("底部带内(0.75) -> 安全", safe.isSafeCandidate(0.05, 0.75));
+        // 屏幕正中 -> 不安全（正文/输入区，点错代价大）
+        check("正中 -> 不安全", !safe.isSafeCandidate(0.04, 0.50));
+        check("偏中上(0.45) -> 不安全", !safe.isSafeCandidate(0.04, 0.45));
+        // 太大 -> 不安全
+        check("大面积 -> 不安全", !safe.isSafeCandidate(0.30, 0.06));
+        check("刚好超限 -> 不安全", !safe.isSafeCandidate(0.13, 0.06));
+        // 面积未知(0)时只按位置判断，不因为拿不到尺寸就一律拒绝
+        check("面积未知但位置安全 -> 安全", safe.isSafeCandidate(0.0, 0.06));
+        // 关掉稳健模式 -> 一律放行
+        RuleStore.Rules loose = RuleStore.parse(
+                "{\"global\":{\"safeMode\":false},\"skipTexts\":[\"跳过\"],\"strongTexts\":[\"跳过\"]}");
+        check("稳健模式关 -> 正中也可点", loose.isSafeCandidate(0.9, 0.50));
+
+        System.out.println("== v3.0 安全参数钳制 ==");
+        RuleStore.Rules sc = RuleStore.parse(
+                "{\"global\":{\"splashWindowMs\":1,\"episodeCooldownMs\":1,"
+                        + "\"safeMaxArea\":5.0,\"safeTopBand\":-1.0,\"safeBottomBand\":99.0},"
+                        + "\"skipTexts\":[\"跳过\"],\"strongTexts\":[\"跳过\"]}");
+        eq("splashWindowMs 下限 1000", sc.splashWindowMs, 1000);
+        eq("episodeCooldownMs 下限 1000", sc.episodeCooldownMs, 1000);
+        check("safeMaxArea 上限 1.0", Math.abs(sc.safeMaxArea - 1.0) < 1e-9);
+        check("safeTopBand 下限 0.05", Math.abs(sc.safeTopBand - 0.05) < 1e-9);
+        check("safeBottomBand 上限 0.99", Math.abs(sc.safeBottomBand - 0.99) < 1e-9);
+
+        System.out.println("== v3.0 strongTexts 收窄（防图标误伤） ==");
+        // v3.0 去掉了 "skipad"/"skip" 这两个过宽的词，
+        // 否则靠 ID 命中的纯图标候选也能进候选池。
+        check("strongTexts 不含过宽的 skip", !r.strongTexts.contains("skip"));
+        check("strongTexts 不含过宽的 skipad", !r.strongTexts.contains("skipad"));
+        check("strongTexts 仍含 跳过", r.strongTexts.contains("跳过"));
+
+        System.out.println("== v3.0 抖音单独规则 ==");
+        check("抖音有单独配置", r.apps.containsKey(dy));
+        eq("抖音显示名", r.nameOf(dy), "抖音");
+        check("抖音可监听", r.shouldWatch(dy));
+
+        System.out.println("== v3.0 pickBest 优先安全候选 ==");
+        // 高分但不安全（例如正中大块）vs 低分但安全的小按钮
+        SkipEngine.Cand riskyHigh = cand(true, true, false, true, 0, 0.40, 0.95, 0.50, false);
+        riskyHigh.safe = false;                      // 正中 -> 不安全
+        SkipEngine.Cand safeLow = cand(false, true, false, false, -1, 0.03, 0.90, 0.06, false);
+        safeLow.safe = true;                         // 右上小按钮 -> 安全
+
+        check("不安全候选分更高（前提成立）", riskyHigh.score() > safeLow.score());
+        List<SkipEngine.Cand> mixed = new ArrayList<SkipEngine.Cand>();
+        mixed.add(riskyHigh);
+        mixed.add(safeLow);
+        check("优先返回安全候选", SkipEngine.pickBest(mixed) == safeLow);
+
+        // 只有不安全候选时，仍返回它（由 Service 记日志并拦下，保持诊断可见）
+        List<SkipEngine.Cand> onlyRisky = new ArrayList<SkipEngine.Cand>();
+        onlyRisky.add(riskyHigh);
+        check("只剩不安全候选 -> 仍返回（供服务层拦下并记录）",
+                SkipEngine.pickBest(onlyRisky) == riskyHigh);
+
+        // 都安全时按分数取高
+        SkipEngine.Cand s1 = cand(true, true, false, true, 0, 0.03, 0.90, 0.06, true);
+        s1.safe = true;
+        SkipEngine.Cand s2 = cand(false, true, false, false, -1, 0.05, 0.88, 0.10, false);
+        s2.safe = true;
+        List<SkipEngine.Cand> twoSafe = new ArrayList<SkipEngine.Cand>();
+        twoSafe.add(s1);
+        twoSafe.add(s2);
+        check("都安全时取分高者", SkipEngine.pickBest(twoSafe) == s1);
 
         System.out.println();
         System.out.println("========================");
         System.out.println("通过 " + pass + " 项，失败 " + fail + " 项");
         System.out.println("========================");
         if (fail > 0) System.exit(1);
+    }
+
+    /** 构造 decideForeground 的上下文（参数顺序：watching/lastFg/lastEp/endMs/sawSys/now）。 */
+    private static RuleStore.Rules.FgContext ctx(String watching, String lastFg, String lastEp,
+                                                long endMs, long lastEndMs, boolean sawSys, long now) {
+        RuleStore.Rules.FgContext c = new RuleStore.Rules.FgContext();
+        c.watchingPkg = watching;
+        c.lastFgPkg = lastFg;
+        c.lastEpisodePkg = lastEp;
+        c.lastEpisodeEndMs = lastEndMs;
+        c.sawSystemSinceEpisode = sawSys;
+        c.now = now;
+        return c;
     }
 
     /**
@@ -379,6 +523,10 @@ public class EngineTest {
         c.nx = nx;
         c.ny = ny;
         c.hasDigit = hasDigit;
+        // 默认按「小而靠边」判安全，与 collect() 的算法一致；
+        // 需要构造不安全候选时由调用方覆盖。
+        c.safe = areaRatio <= 0.12 && (ny <= 0.30 || ny >= 0.75);
+        c.textHit = exactHit || strongHit;
         return c;
     }
 
