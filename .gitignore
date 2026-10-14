@@ -1,0 +1,23 @@
+# 构建产物
+out/
+gen/
+*.apk.idsig
+
+# 签名密钥库：不上传（含私钥）。
+# build.ps1 在密钥库缺失时会自动重新生成一份，
+# 所以克隆仓库后依然可以正常编译，只是签名指纹与发布版不同。
+keystore/
+
+# 临时/测试文件
+_gh_*.js
+_get_token*.ps1
+_cn_test/
+dist/
+icon_preview.png
+
+# 系统与编辑器
+Thumbs.db
+desktop.ini
+.idea/
+*.iml
+.vscode/

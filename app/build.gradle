@@ -1,0 +1,40 @@
+// 注意：本项目刻意不依赖 AndroidX。
+// 界面全部用系统原生控件以代码构建，规则解析用 android.jar 内置的 org.json，
+// 这样一个额外依赖都不需要，手工编译（build.ps1）也不必引入 desugaring。
+
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.lbx.skipad'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "com.lbx.skipad"
+        minSdk 24
+        targetSdk 34
+        versionCode 1
+        versionName "1.0"
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_11
+        targetCompatibility JavaVersion.VERSION_11
+    }
+
+    lint {
+        abortOnError false
+    }
+}
+
+dependencies {
+    // 无第三方依赖
+}

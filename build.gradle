@@ -1,0 +1,9 @@
+// 这个项目可以用两种方式编译：
+//   1. Android Studio 直接打开本目录（标准 Gradle 结构）
+//   2. 不装 Android Studio：pwsh -File build.ps1（用随包附带的工具链手工编译）
+//
+// 手工编译路径不依赖 Gradle，脚本见 build.ps1。
+
+plugins {
+    id 'com.android.application' version '8.1.4' apply false
+}

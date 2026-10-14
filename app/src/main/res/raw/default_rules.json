@@ -1,0 +1,68 @@
+{
+  "global": {
+    "watchAll": true,
+    "scanIntervalMs": 120,
+    "maxTextLen": 8,
+    "maxWaitMs": 15000,
+    "retryLimit": 5,
+    "continueAfterSkip": false
+  },
+
+  "skipTexts": [
+    "跳过",
+    "跳过广告",
+    "关闭广告",
+    "跳过此广告",
+    "点击跳过",
+    "跳过 >",
+    "Skip",
+    "Skip Ad",
+    "Skip Ads",
+    "SKIP"
+  ],
+
+  "strongTexts": [
+    "跳过",
+    "关闭广告",
+    "跳过广告"
+  ],
+
+  "denyTexts": [
+    "跳过此步骤",
+    "跳过此步",
+    "跳过引导",
+    "跳过教程",
+    "跳过学习",
+    "跳过验证",
+    "跳过登录",
+    "暂不跳过",
+    "取消"
+  ],
+
+  "skipIds": [
+    "*:*skip*",
+    "*:*close_ad*",
+    "*:*closead*",
+    "*:*ad_close*"
+  ],
+
+  "excludeApps": [
+    "com.android.settings",
+    "com.android.systemui",
+    "com.android.launcher",
+    "com.android.launcher3",
+    "com.google.android.apps.nexuslauncher",
+    "com.miui.home",
+    "com.huawei.android.launcher",
+    "com.oppo.launcher",
+    "com.vivo.launcher",
+    "com.bbk.launcher2",
+    "com.android.vending",
+    "com.google.android.packageinstaller",
+    "com.android.packageinstaller",
+    "com.android.permissioncontroller",
+    "com.lbx.skipad"
+  ],
+
+  "apps": {}
+}
