@@ -568,6 +568,39 @@ public class EngineTest {
         check("默认规则下：广告页 0.45 处放宽后仍不放过超大候选",
                 !r.isSafeCandidate(0.40, 0.45, true));
 
+        // ================================================================
+        // v3.2 身份已确认按钮：免面积上限 / 免位置安全带 / 免文字闸门
+        // 专门救「带倒计时的大『跳过』条」「SDK 关闭按钮」「互动广告关闭键」。
+        // ================================================================
+        System.out.println("== v3.2 身份已确认：大按钮也能点 ==");
+        // 普通模式下，中部 0.50、面积 0.40 的大块原本会被 safeMaxArea + 安全带双重拦下。
+        check("普通模式 中部大块(0.40) -> 不安全（v3.0 行为不变）",
+                !r.isSafeCandidate(0.40, 0.50, false, false));
+        // 同一大块，但身份已确认（精确 skip 文字 / 命中 skip id）-> 放行
+        // （仍受 CONTAINER_AREA_CAP=0.55 约束，全屏容器不算）。
+        check("身份已确认 中部大块(0.40) -> 安全（v3.2 救大『跳过』条）",
+                r.isSafeCandidate(0.40, 0.50, false, true));
+        // 全屏容器（>0.55）即使身份已确认也不放行 —— 那是广告大图/视频，点中会跳转。
+        check("身份已确认 全屏容器(0.70) -> 仍不安全（防点进落地页）",
+                !r.isSafeCandidate(0.70, 0.50, false, true));
+
+        System.out.println("== v3.2 身份已确认：免文字闸门（救 SDK 关闭键/互动广告） ==");
+        // 仅靠 ID 命中的纯图标关闭按钮（无文字），普通模式会被「必须有文字依据」拦下；
+        // v3.2 中 idHit 即视为身份已确认，绕过该闸门。
+        // （collect() 里 c.safe 的闸门为 !safeMode || textHit || idHit || relaxed，
+        //   这里用 isSafeCandidate 的 identified 分支验证位置/面积逻辑，文字闸门在 collect 层覆盖。）
+        check("身份已确认 仅靠 ID 的大关闭按钮(0.35) -> 安全",
+                r.isSafeCandidate(0.30, 0.35, false, true));
+        check("身份已确认 仅靠 ID 的关闭按钮落底部 -> 安全",
+                r.isSafeCandidate(0.05, 0.92, false, true));
+
+        System.out.println("== v3.2 关闭键文案/ID 扩充（救互动广告） ==");
+        check("skipTexts 含 关闭广告", r.skipTexts.contains("关闭广告"));
+        check("skipTexts 含 关闭该广告", r.skipTexts.contains("关闭该广告"));
+        check("skipTexts 含 点击关闭", r.skipTexts.contains("点击关闭"));
+        check("skipIds 含 开屏关闭 *:splash_close*", r.skipIds.contains("*:*splash_close*"));
+
+
         System.out.println();
         System.out.println("========================");
         System.out.println("通过 " + pass + " 项，失败 " + fail + " 项");
@@ -605,6 +638,8 @@ public class EngineTest {
         c.nx = nx;
         c.ny = ny;
         c.hasDigit = hasDigit;
+        // 身份已确认：精确文字或命中 id（与 collect() 的判定一致），便于 v3.2 测试复用。
+        c.identified = exactHit || idHit;
         // 默认按「小而靠边」判安全，与 collect() 的算法一致；
         // 需要构造不安全候选时由调用方覆盖。
         c.safe = areaRatio <= 0.12 && (ny <= 0.30 || ny >= 0.75);

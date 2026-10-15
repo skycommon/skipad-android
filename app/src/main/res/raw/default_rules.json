@@ -35,15 +35,22 @@
     "跳过广告",
     "跳过此广告",
     "关闭广告",
+    "关闭该广告",
     "关闭此广告",
+    "关闭广告X",
     "点击跳过",
+    "点击关闭",
+    "关闭预览",
     "跳过 >",
     "跳过>>",
     "跳过广告 >",
     "Skip",
     "Skip Ad",
     "Skip Ads",
-    "SKIP"
+    "SKIP",
+    "Close",
+    "CLOSE",
+    "关闭广告X"
   ],
 
   "strongTexts": [
@@ -92,7 +99,8 @@
     "*:*ad_close*",
     "*:*close_ads*",
     "*:*ad_skip*",
-    "*:*skip_ad*"
+    "*:*skip_ad*",
+    "*:*splash_close*"
   ],
 
   "excludeApps": [

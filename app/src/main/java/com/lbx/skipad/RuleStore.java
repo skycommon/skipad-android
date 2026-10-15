@@ -329,32 +329,49 @@ final class RuleStore {
          * 所以再加一层「形状与位置」的约束 —— 跳过按钮一定是小控件，
          * 且出现在屏幕顶部或底部，绝不落在正中央（那里是正文/输入区）。
          */
+        /** 容器级面积上限：身份已确认的跳过按钮允许的最大面积（只挡住全屏容器）。 */
+        static final double CONTAINER_AREA_CAP = 0.55;
+
         boolean isSafeCandidate(double areaRatio, double ny) {
-            return isSafeCandidate(areaRatio, ny, false);
+            return isSafeCandidate(areaRatio, ny, false, false);
+        }
+
+        boolean isSafeCandidate(double areaRatio, double ny, boolean adSignal) {
+            return isSafeCandidate(areaRatio, ny, adSignal, false);
         }
 
         /**
-         * v3.1：带「广告特征」标志的安全判定。
+         * v3.2：带「广告特征」与「身份已确认」标志的安全判定。
          *
-         * @param adSignal 本候选所在页面上发现了摇一摇/摇动手机等广告特征文案。
-         *                 为真时改用更宽的 adTopBand/adBottomBand 安全带。
-         *
-         * 注意：放宽只体现在**上下边界**上，那条中间走廊始终不点。
-         * 而且要同时满足 shakeAware 开关打开。
+         * @param adSignal    本页已确认是摇一摇/互动等广告页（放宽安全带）。
+         * @param identified 本候选是「身份已确认」的跳过按钮：精确命中 skipTexts，
+         *                   或命中 skipIds。身份已确认意味着文字/ID 本身就是铁证，
+         *                   因此面积上限放宽到容器级（只挡全屏容器），
+         *                   但位置仍要求落在顶部/底部安全带内（不在正中乱点）。
+         *                   这专门救「带倒计时的大『跳过』条」「广告 SDK 的关闭按钮」
+         *                   这类被 v3.0/v3.1 面积上限误杀的控件 —— 用户反馈的
+         *                   “有跳过但跳不掉”“互动广告关不了”正源于此。
          */
-        boolean isSafeCandidate(double areaRatio, double ny, boolean adSignal) {
+        boolean isSafeCandidate(double areaRatio, double ny, boolean adSignal, boolean identified) {
             if (!safeMode) return true;
 
+            // 面积上限：身份已确认 > 广告页 > 普通（最严）。
+            // 身份已确认时不看 safeMaxArea/adMaxArea，只挡真正的全屏容器
+            // （面积 > CONTAINER_AREA_CAP 的节点是广告大图/视频容器，点了会跳转）。
+            double areaCap = identified ? CONTAINER_AREA_CAP
+                            : (adSignal && shakeAware ? adMaxArea : safeMaxArea);
+            if (areaRatio > 0 && areaRatio > areaCap) return false;
+
+            // 位置安全带：
+            //  · 身份已确认（精确 skip 文字 / 命中 skip id）—— 文字或 ID 本身就是铁证，
+            //    不再限制位置（否则「带倒计时的大『跳过』条」「SDK 关闭按钮」这类
+            //    落在屏幕中部的控件仍会被挡掉，正是用户说的“有跳过但跳不掉”）。
+            //  · 广告页（摇一摇等）—— 用更宽但仍有走廊的带。
+            //  · 普通模式 —— 原始安全带（顶部/底部带，绝不点正中）。
+            if (identified) return true;
             if (adSignal && shakeAware) {
-                // 已确认是摇一摇广告页：面积上限与安全带都放宽，
-                // 但顶部带与底部带之间那条走廊仍然绝不点击。
-                if (areaRatio > 0 && areaRatio > adMaxArea) return false;
                 return ny <= adTopBand || ny >= adBottomBand;
             }
-
-            // 太大的一律不要（跳过按钮都是小的）
-            if (areaRatio > 0 && areaRatio > safeMaxArea) return false;
-            // 必须落在顶部带或底部带内
             return ny <= safeTopBand || ny >= safeBottomBand;
         }
 

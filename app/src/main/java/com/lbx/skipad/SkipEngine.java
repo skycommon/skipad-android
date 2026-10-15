@@ -115,6 +115,17 @@ final class SkipEngine {
          */
         boolean adSignal;
 
+        /**
+         * v3.2：本候选是否为「身份已确认」的跳过按钮。
+         *
+         * 满足其一即为真：精确命中 skipTexts（kind==2）或命中 skipIds。
+         * 这两类本就是跳过的铁证，因此放宽安全带时只对它们彻底解开
+         * 面积上限与位置约束（仍需排除全屏广告容器，避免点进落地页）：
+         * 这是救「带倒计时的大『跳过』条」「广告 SDK 的关闭按钮」「互动广告关闭键」
+         * 的关键 —— 它们常是大块、且落在屏幕中部，被 v3.0/v3.1 的形状约束误杀。
+         */
+        boolean identified;
+
         /** 综合打分。纯函数，不碰 node。 */
         int score() {
             int s = 0;
@@ -381,14 +392,20 @@ final class SkipEngine {
                     c.clickableDepth = clickableDepthOf(n);
 
                     // v3.0：稳健模式下按「文字依据 + 形状 + 位置」判定是否安全可点
-                    // v3.1：若本页已确认是摇一摇广告，则改用放宽的安全带；
-                    //       并且**免除**「文字依据」这一条 —— 摇一摇那句提示本身
-                    //       就是最硬的页面证据（跳过按钮常是纯图片、没有文字）。
+                    // v3.1：若本页已确认是摇一摇广告，则改用放宽的安全带，
+                    //       并**免除**「文字依据」闸门（摇一摇提示本身就是页面证据）。
+                    // v3.2：身份已确认（精确 skip 文字命中 或 命中 skip id）的候选视为铁证，
+                    //       免面积上限、免位置安全带、免「文字依据」闸门 —— 专门救
+                    //       「带倒计时的大『跳过』条」「SDK 关闭按钮」「互动广告的关闭键」
+                    //       这类被面积/位置误杀的控件（用户反馈：有跳过却跳不掉、互动广告关不了）。
                     c.textHit = kind > 0;
                     c.adSignal = adSignal;
+                    // 身份已确认 = 精确文字匹配（kind==2）或命中控件 ID。
+                    // 这两类本身就是跳过的铁证，不再被「太小/太靠边」约束。
+                    c.identified = c.exactHit || c.idHit;
                     boolean relaxed = adSignal && r.shakeAware;
-                    c.safe = r.isSafeCandidate(areaRatio, c.ny, adSignal)
-                            && (!r.safeMode || c.textHit || relaxed);
+                    c.safe = r.isSafeCandidate(areaRatio, c.ny, adSignal, c.identified)
+                            && (!r.safeMode || c.textHit || c.idHit || relaxed);
 
                     String shown = !txt.isEmpty() ? txt : desc;
                     if (byId) {
