@@ -93,7 +93,7 @@ public class MainActivity extends android.app.Activity {
         root.addView(t);
 
         TextView s = new TextView(this);
-        s.setText("v3.0 · 防误触 · 多窗口扫描 · 本地运行 · 不联网");
+        s.setText("v3.1 · 防误触 · 摇一摇广告 · 多窗口扫描 · 本地运行 · 不联网");
         s.setTextSize(13);
         s.setTextColor(C_SUB);
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
@@ -364,6 +364,8 @@ public class MainActivity extends android.app.Activity {
             sb.append("控件 ID：").append(r.skipIds.size()).append(" 条\n");
             sb.append("排除应用：").append(r.excludeApps.size()).append(" 个\n");
             sb.append("单独配置：").append(r.apps.size()).append(" 个\n");
+            sb.append("摇一摇广告放宽：").append(r.shakeAware ? "开" : "关")
+              .append("（特征词 ").append(r.adTexts.size()).append(" 条）\n");
             sb.append("观察窗口：").append(r.maxWaitMs / 1000).append(" 秒 · 扫描间隔 ")
                     .append(r.scanIntervalMs).append(" 毫秒");
             ruleSummary.setText(sb.toString());

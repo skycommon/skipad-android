@@ -486,6 +486,88 @@ public class EngineTest {
         twoSafe.add(s2);
         check("都安全时取分高者", SkipEngine.pickBest(twoSafe) == s1);
 
+        // ================================================================
+        // v3.1 摇一摇广告放宽
+        // ================================================================
+        System.out.println("== v3.1 摇一摇广告特征识别（isAdSignal） ==");
+        check("adTexts 非空", !r.adTexts.isEmpty());
+        check("shakeAware 默认开", r.shakeAware);
+        check("shakeBlindTap 默认关", !r.shakeBlindTap);
+        check("adTexts 含 摇一摇", r.adTexts.contains("摇一摇"));
+        check("adTexts 含 摇动手机", r.adTexts.contains("摇动手机"));
+
+        check("命中「摇一摇」", r.isAdSignal("摇一摇"));
+        check("命中「摇一摇跳转详情」", r.isAdSignal("摇一摇跳转详情"));
+        check("命中「摇动手机」", r.isAdSignal("摇动手机"));
+        check("命中带标点「摇一摇，了解更多」", r.isAdSignal("摇一摇，了解更多"));
+        check("不命中「跳过」", !r.isAdSignal("跳过"));
+        check("不命中「设置」", !r.isAdSignal("设置"));
+        check("不命中空串", !r.isAdSignal(""));
+        check("不命中 null", !r.isAdSignal(null));
+
+        System.out.println("== v3.1 广告页放宽安全带（isSafeCandidate 三参） ==");
+        RuleStore.Rules shake = RuleStore.parse(
+                "{\"global\":{\"safeMode\":true,\"safeMaxArea\":0.12,\"safeTopBand\":0.30,"
+                        + "\"safeBottomBand\":0.75,\"shakeAware\":true,\"adTopBand\":0.60,"
+                        + "\"adBottomBand\":0.75,\"adMaxArea\":0.25},"
+                        + "\"skipTexts\":[\"跳过\"],\"strongTexts\":[\"跳过\"]}");
+
+        // v3.0 会拦下的位置：纵位置 0.45，非广告页仍然拦下（回归保护）
+        check("非广告页 0.45 -> 不安全（v3.0 行为不变）",
+                !shake.isSafeCandidate(0.04, 0.45, false));
+        // 同一位置，但已确认是摇一摇广告页 -> 放宽后安全
+        check("广告页 0.45 -> 安全（v3.1 放宽）", shake.isSafeCandidate(0.04, 0.45, true));
+        check("广告页 0.55 -> 安全", shake.isSafeCandidate(0.04, 0.55, true));
+        check("广告页 0.60（顶部带边界）-> 安全", shake.isSafeCandidate(0.04, 0.60, true));
+        // 中间走廊永远不点：顶部带 0.60 与底部带 0.75 之间
+        check("广告页 0.70 走廊内 -> 不安全", !shake.isSafeCandidate(0.04, 0.70, true));
+        check("广告页 0.75（底部带边界）-> 安全", shake.isSafeCandidate(0.04, 0.75, true));
+        check("广告页 0.85 -> 安全（底部带）", shake.isSafeCandidate(0.04, 0.85, true));
+        // 面积：普通模式下 0.20 超限，广告页放宽到 0.25 后放行
+        check("非广告页 面积0.20 -> 不安全", !shake.isSafeCandidate(0.20, 0.45, false));
+        check("广告页 面积0.20 -> 安全", shake.isSafeCandidate(0.20, 0.45, true));
+        check("广告页 面积0.30 -> 不安全（超 adMaxArea）",
+                !shake.isSafeCandidate(0.30, 0.45, true));
+        // 关掉 shakeAware -> 回到 v3.0 行为
+        RuleStore.Rules noShake = RuleStore.parse(
+                "{\"global\":{\"safeMode\":true,\"shakeAware\":false},"
+                        + "\"skipTexts\":[\"跳过\"],\"strongTexts\":[\"跳过\"]}");
+        check("shakeAware 关 -> 广告页也不放宽",
+                !noShake.isSafeCandidate(0.04, 0.45, true));
+        // 二参重载等价于 adSignal=false
+        check("二参重载 == adSignal false",
+                shake.isSafeCandidate(0.04, 0.45) == shake.isSafeCandidate(0.04, 0.45, false));
+
+        System.out.println("== v3.1 广告页安全带钳制 ==");
+        RuleStore.Rules adClamp = RuleStore.parse(
+                "{\"global\":{\"adTopBand\":5.0,\"adBottomBand\":-5.0,\"adMaxArea\":9.0},"
+                        + "\"skipTexts\":[\"跳过\"],\"strongTexts\":[\"跳过\"]}");
+        check("adTopBand 上限 0.80", Math.abs(adClamp.adTopBand - 0.80) < 1e-9);
+        // 上下带之间必须留走廊：adBottomBand 被抬到 adTopBand+0.05 以上
+        check("上下带之间留走廊",
+                adClamp.adBottomBand >= adClamp.adTopBand + 0.05 - 1e-9
+                        || adClamp.adBottomBand >= 0.99 - 1e-9);
+        check("adMaxArea 上限 0.55", Math.abs(adClamp.adMaxArea - 0.55) < 1e-9);
+
+        System.out.println("== v3.1 摇一摇广告下免除文字依据 ==");
+        // 摇一摇广告的「跳过」常是纯图片（无文字）。已确认广告页时应放行，
+        // 非广告页时仍要求文字依据（保护抖音搜索图标场景）。
+        check("adTexts 不含过宽的「下载」", !r.adTexts.contains("下载"));
+        check("adTexts 不含过宽的「立即」", !r.adTexts.contains("立即"));
+
+        // 默认规则必须真的能救回被 logo 挤下来的「跳过」按钮。
+        // 否则参数写得再漂亮也只是纸面放宽。
+        check("默认 adTopBand = 0.60", Math.abs(r.adTopBand - 0.60) < 1e-9);
+        check("默认 adBottomBand = 0.75（与普通页一致，不动底部带）",
+                Math.abs(r.adBottomBand - 0.75) < 1e-9);
+        check("默认 adMaxArea = 0.25", Math.abs(r.adMaxArea - 0.25) < 1e-9);
+        check("默认规则下：广告页 0.45 可点（v3.1 要救的正是一带）",
+                r.isSafeCandidate(0.04, 0.45, true));
+        check("默认规则下：非广告页 0.45 仍不可点（防线没被拆）",
+                !r.isSafeCandidate(0.04, 0.45, false));
+        check("默认规则下：广告页 0.45 处放宽后仍不放过超大候选",
+                !r.isSafeCandidate(0.40, 0.45, true));
+
         System.out.println();
         System.out.println("========================");
         System.out.println("通过 " + pass + " 项，失败 " + fail + " 项");

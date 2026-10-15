@@ -19,7 +19,15 @@
     "verifyBeforeTap": true,
     "safeMaxArea": 0.12,
     "safeTopBand": 0.30,
-    "safeBottomBand": 0.75
+    "safeBottomBand": 0.75,
+
+    "shakeAware": true,
+    "shakeBlindTap": false,
+    "adTopBand": 0.60,
+    "adBottomBand": 0.75,
+    "adMaxArea": 0.25,
+    "shakeTapX": 0.92,
+    "shakeTapY": 0.055
   },
 
   "skipTexts": [
@@ -42,6 +50,26 @@
     "跳过",
     "关闭广告",
     "跳过广告"
+  ],
+
+  "_adTexts说明": "摇一摇/摇动手机类广告的特征文案。命中不代表要点击，只表示「这确实是广告页」，从而放宽安全带、允许无文字的跳过按钮。刻意只收「摇动/翻转」这类广告专属措辞，不收「立即下载」等正常页面也会出现的词，避免误放宽。",
+  "adTexts": [
+    "摇一摇",
+    "摇一摇跳转",
+    "摇一摇了解更多",
+    "摇一摇立即跳转",
+    "摇动手机",
+    "摇动手机跳转",
+    "晃动手机",
+    "晃动手机跳转",
+    "扭一扭",
+    "翻转手机",
+    "转动手机",
+    "摇动",
+    "晃动",
+    "跳转第三方",
+    "跳转广告",
+    "跳转详情"
   ],
 
   "denyTexts": [

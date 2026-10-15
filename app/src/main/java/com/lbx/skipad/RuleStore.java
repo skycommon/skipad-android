@@ -169,10 +169,39 @@ final class RuleStore {
             // 屏幕中部通常是正文/输入区，点错代价大。
             r.safeTopBand = clampDouble(g.optDouble("safeTopBand", 0.30), 0.05, 0.6);
             r.safeBottomBand = clampDouble(g.optDouble("safeBottomBand", 0.75), 0.4, 0.99);
+
+            // ----------------------------------------------------------
+            // v3.1「摇一摇广告」放宽（默认开）
+            //
+            // 问题：v3.0 的安全带只允许点顶部 30% 或底部 25%。但摇一摇广告
+            // 把品牌 logo 和「摇一摇」提示放在最上面，于是把「跳过」按钮
+            // **往下挤**（常见落在 30%~50% 一带）—— 正好被 v3.0 判成不安全，
+            // 表现为「有摇一摇字样的广告就不跳了」。
+            //
+            // 修法：一旦在页面上发现摇一摇/摇动手机这类**广告特征文案**，
+            // 就说明这确实是广告页、不是正常界面，于是把安全带放宽到
+            // adTopBand / adBottomBand，但**中间永远留一条绝不点的走廊**。
+            // ----------------------------------------------------------
+            r.shakeAware = g.optBoolean("shakeAware", true);
+            // 连跳过按钮的节点都没有时，是否允许在角落按坐标兜底点一次。
+            // 默认关：这是唯一还会「凭坐标猜」的动作，风险最高，需用户显式开启。
+            r.shakeBlindTap = g.optBoolean("shakeBlindTap", false);
+            r.adTopBand = clampDouble(g.optDouble("adTopBand", 0.60), r.safeTopBand, 0.80);
+            r.adBottomBand = clampDouble(g.optDouble("adBottomBand", 0.80), 0.30, r.safeBottomBand);
+            // 保证顶部带与底部带之间始终留一条走廊，否则「放宽」就等于全屏可点。
+            if (r.adBottomBand < r.adTopBand + 0.05) {
+                r.adBottomBand = Math.min(0.99, r.adTopBand + 0.05);
+            }
+            r.shakeTapX = clampDouble(g.optDouble("shakeTapX", 0.92), 0.0, 1.0);
+            r.shakeTapY = clampDouble(g.optDouble("shakeTapY", 0.055), 0.0, 1.0);
+            // 摇一摇广告的「跳过」常做成一整条（文字 + 倒计时）的宽条，
+            // 面积会超过 safeMaxArea。已确认是广告页时给一个更宽的上限。
+            r.adMaxArea = clampDouble(g.optDouble("adMaxArea", 0.25), r.safeMaxArea, 0.55);
         }
 
         r.skipTexts = toList(root.optJSONArray("skipTexts"));
         r.strongTexts = toList(root.optJSONArray("strongTexts"));
+        r.adTexts = toList(root.optJSONArray("adTexts"));
         r.denyTexts = toList(root.optJSONArray("denyTexts"));
         r.skipIds = toList(root.optJSONArray("skipIds"));
         r.excludeApps = new HashSet<String>(toList(root.optJSONArray("excludeApps")));
@@ -259,6 +288,39 @@ final class RuleStore {
         double safeTopBand = 0.30;
         double safeBottomBand = 0.75;
 
+        // ---------------- v3.1 摇一摇广告放宽 ----------------
+
+        /**
+         * 摇一摇广告放宽（默认开）。
+         *
+         * 摇一摇广告会把品牌 logo 与「摇一摇」提示放在屏幕最上方，
+         * 于是「跳过」被往下挤（常见落在 30%~55%），正好落在 v3.0 安全带之外，
+         * 表现为「有摇一摇字样的广告不跳了」。开启后：一旦在页面上发现
+         * 摇一摇/摇动手机这类广告特征文案，就改用更宽的安全带。
+         */
+        boolean shakeAware = true;
+        /**
+         * 检测到摇一摇广告时使用的安全带（比 safe 系列更宽）。
+         * 两者之间那条走廊**永不点击** —— 放宽的前提是「知道这确实是广告页」，
+         * 而不是「哪都能点」。
+         *
+         * 注意 adBottomBand 的语义是「底部带从哪开始」，它被钳制在
+         * [0.30, safeBottomBand] 内 —— 也就是说它**只能往上挪**（值变小＝允许点击
+         * 的范围向屏幕中部扩展），不能往下挪。默认 0.75 与普通模式一致，
+         * 即底部带的放宽并无必要：真正的痛点在上方（跳过按钮被 logo 挤到 0.30~0.55）。
+         */
+        double adTopBand = 0.60;
+        double adBottomBand = 0.75;
+        /**
+         * 已确认是广告页时放宽的面积上限。
+         * 摇一摇广告的「跳过」常是「文字 + 倒计时」一整条宽条，比普通小按钮大。
+         */
+        double adMaxArea = 0.25;
+        /** 摇一摇广告下，连跳过节点都没有时按坐标兜底点击的坐标（默认关、默认右上角）。 */
+        boolean shakeBlindTap = false;
+        double shakeTapX = 0.92;
+        double shakeTapY = 0.055;
+
         /**
          * 判断某个候选在稳健模式下是否安全可点。
          *
@@ -268,17 +330,69 @@ final class RuleStore {
          * 且出现在屏幕顶部或底部，绝不落在正中央（那里是正文/输入区）。
          */
         boolean isSafeCandidate(double areaRatio, double ny) {
+            return isSafeCandidate(areaRatio, ny, false);
+        }
+
+        /**
+         * v3.1：带「广告特征」标志的安全判定。
+         *
+         * @param adSignal 本候选所在页面上发现了摇一摇/摇动手机等广告特征文案。
+         *                 为真时改用更宽的 adTopBand/adBottomBand 安全带。
+         *
+         * 注意：放宽只体现在**上下边界**上，那条中间走廊始终不点。
+         * 而且要同时满足 shakeAware 开关打开。
+         */
+        boolean isSafeCandidate(double areaRatio, double ny, boolean adSignal) {
             if (!safeMode) return true;
+
+            if (adSignal && shakeAware) {
+                // 已确认是摇一摇广告页：面积上限与安全带都放宽，
+                // 但顶部带与底部带之间那条走廊仍然绝不点击。
+                if (areaRatio > 0 && areaRatio > adMaxArea) return false;
+                return ny <= adTopBand || ny >= adBottomBand;
+            }
+
             // 太大的一律不要（跳过按钮都是小的）
             if (areaRatio > 0 && areaRatio > safeMaxArea) return false;
             // 必须落在顶部带或底部带内
             return ny <= safeTopBand || ny >= safeBottomBand;
         }
 
+        /**
+         * 这段文字是不是「摇一摇广告」的特征文案。
+         *
+         * 用途不是决定「点哪里」，而是决定「要不要放宽安全带」。
+         * 也就是说：只有先确认这确实是一张广告页，才敢让跳过按钮
+         * 落在平时不允许的位置上。没有这个前提，放宽就等于失去防线。
+         */
+        boolean isAdSignal(String rawText) {
+            if (rawText == null || rawText.isEmpty()) return false;
+            String c = compactForAd(rawText);
+            if (c.isEmpty()) return false;
+            for (String k : adTexts) {
+                String kc = compactForAd(k);
+                if (!kc.isEmpty() && c.contains(kc)) return true;
+            }
+            return false;
+        }
+
+        /** 与 SkipEngine.compact 同样的压缩（去空白与标点），用于广告特征比对。 */
+        private static String compactForAd(String s) {
+            StringBuilder sb = new StringBuilder(s.length());
+            for (int i = 0; i < s.length(); i++) {
+                char ch = s.charAt(i);
+                if (Character.isWhitespace(ch)) continue;
+                if (Character.isLetterOrDigit(ch)) sb.append(ch);
+            }
+            return sb.toString().toLowerCase(java.util.Locale.ROOT);
+        }
+
         List<String> skipTexts = new ArrayList<String>();
         List<String> strongTexts = new ArrayList<String>();
         List<String> denyTexts = new ArrayList<String>();
         List<String> skipIds = new ArrayList<String>();
+        /** v3.1：摇一摇等广告特征文案，命中即放宽安全带（不直接点击）。 */
+        List<String> adTexts = new ArrayList<String>();
         Set<String> excludeApps = new HashSet<String>();
         Map<String, AppRule> apps = new HashMap<String, AppRule>();
 

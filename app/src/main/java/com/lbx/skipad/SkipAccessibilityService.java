@@ -451,7 +451,8 @@ public class SkipAccessibilityService extends AccessibilityService {
         if (best != null && !best.safe) {
             lastScanReason = "已拦下不安全候选：" + best.reason
                     + "（面积" + Math.round(best.areaRatio * 100) + "%，纵位置"
-                    + Math.round(best.ny * 100) + "%）";
+                    + Math.round(best.ny * 100) + "%"
+                    + (best.adSignal ? "，摇一摇广告页但仍在走廊内" : "") + "）";
             Log.i(TAG, lastScanReason);
             // 不点，但也不再重试同一类候选：直接结束本轮，避免反复评估。
             if (!r.continueAfterSkip) endWatch(false);
@@ -461,6 +462,39 @@ public class SkipAccessibilityService extends AccessibilityService {
         if (best == null) {
             lastScanReason = "未命中（窗口: " + winInfo
                     + (skippedWins > 0 ? "，已跳过 " + skippedWins + " 个排除窗口" : "") + "）";
+
+            // ------------------------------------------------------------
+            // v3.1 摇一摇广告兜底。
+            //
+            // 有些摇一摇广告的「跳过」是纯图片、连节点 ID 都没有，
+            // 无障碍树里根本找不到任何候选。这时唯一还能做的，是在**已确认
+            // 是广告页**（页面上有「摇一摇」字样）的前提下，按坐标点一次。
+            // 默认关闭（shakeBlindTap=false）：这是全应用里唯一凭坐标猜的动作，
+            // 风险最高，必须用户显式打开。
+            // ------------------------------------------------------------
+            boolean adPage = false;
+            if (r.shakeAware) {
+                try {
+                    int[] probe = new int[]{SkipEngine.MAX_NODES / 2};
+                    for (int i = 0; i < roots.size() && !adPage; i++) {
+                        adPage = SkipEngine.hasAdSignal(roots.get(i), r, probe);
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
+            if (adPage && !lastScanReason.contains("摇一摇")) {
+                lastScanReason += "，检测到摇一摇广告特征";
+            }
+
+            if (adPage && r.shakeBlindTap && !blindTried && attempts < r.retryLimit) {
+                blindTried = true;
+                attempts++;
+                boolean ok = SkipEngine.tapNormalized(this, screenW, screenH,
+                        r.shakeTapX, r.shakeTapY);
+                if (ok) {
+                    lastScanReason = "摇一摇广告兜底点击 " + r.shakeTapX + "," + r.shakeTapY;
+                }
+            }
 
             // 抓诊断快照：趁广告还在屏幕上时抓，而不是等 15 秒超时。
             // 开屏广告一般只显示 3~5 秒，等超时抓到的只会是 App 主界面。

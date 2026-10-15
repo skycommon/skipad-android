@@ -31,7 +31,7 @@ final class SkipEngine {
     private SkipEngine() {}
 
     /** 单次扫描最多看的节点数（所有窗口加起来）。 */
-    private static final int MAX_NODES = 2000;
+    static final int MAX_NODES = 2000;
     /** 从命中节点向上最多回溯多少层找可点击祖先（真正点击时）。 */
     private static final int MAX_ANCESTOR_UP = 8;
     /** 打分时向上探查可点击祖先的层数（比点击时浅，够判断即可）。 */
@@ -105,6 +105,15 @@ final class SkipEngine {
          * 不给纯 ID 候选点击机会。
          */
         boolean textHit;
+
+        /**
+         * v3.1：本候选所在**页面上**发现了摇一摇/摇动手机等广告特征文案。
+         *
+         * 为什么按「页面」而不是按「节点」判断：摇一摇那句提示和「跳过」
+         * 按钮是两个不相干的节点（甚至不在同一个窗口里）。只有把整页
+         * 看一遍，才知道这是广告页，从而敢放宽安全带。
+         */
+        boolean adSignal;
 
         /** 综合打分。纯函数，不碰 node。 */
         int score() {
@@ -298,7 +307,8 @@ final class SkipEngine {
      * @param winW / winH 该窗口的宽高，用于算面积占比与归一化坐标
      */
     static void collect(AccessibilityNodeInfo root, int winW, int winH,
-                        RuleStore.Rules r, String pkg, List<Cand> out, int[] budget) {
+                        RuleStore.Rules r, String pkg, List<Cand> out, int[] budget,
+                        boolean adSignal) {
         if (root == null) return;
 
         List<String> texts = r.textsFor(pkg);
@@ -371,9 +381,14 @@ final class SkipEngine {
                     c.clickableDepth = clickableDepthOf(n);
 
                     // v3.0：稳健模式下按「文字依据 + 形状 + 位置」判定是否安全可点
+                    // v3.1：若本页已确认是摇一摇广告，则改用放宽的安全带；
+                    //       并且**免除**「文字依据」这一条 —— 摇一摇那句提示本身
+                    //       就是最硬的页面证据（跳过按钮常是纯图片、没有文字）。
                     c.textHit = kind > 0;
-                    c.safe = r.isSafeCandidate(areaRatio, c.ny)
-                            && (!r.safeMode || c.textHit);
+                    c.adSignal = adSignal;
+                    boolean relaxed = adSignal && r.shakeAware;
+                    c.safe = r.isSafeCandidate(areaRatio, c.ny, adSignal)
+                            && (!r.safeMode || c.textHit || relaxed);
 
                     String shown = !txt.isEmpty() ? txt : desc;
                     if (byId) {
@@ -426,6 +441,13 @@ final class SkipEngine {
     /**
      * 遍历所有窗口找跳过按钮。返回 null 表示没找到。
      *
+     * v3.1 起是**两趟**扫描：
+     *   第 1 趟：只看文字，判断本页有没有摇一摇/摇动手机这类广告特征
+     *            （adSignal）。这一步不产生候选，只回答一个是非题。
+     *   第 2 趟：带着这个结论去收集候选 —— 因为「跳过按钮允不允许出现在
+     *            靠中间的位置」这件事，取决于第 1 趟的答案。
+     * 两趟的顺序不能颠倒：先知道是广告页，才敢放宽；反过来就成了盲放宽。
+     *
      * @param roots 各窗口的根节点（由服务层用 getWindows() 收集）
      */
     static Cand findBest(List<AccessibilityNodeInfo> roots, List<int[]> sizes,
@@ -433,6 +455,17 @@ final class SkipEngine {
         if (roots == null || roots.isEmpty()) return null;
 
         List<Cand> cands = new ArrayList<Cand>();
+
+        // ---- 第 1 趟：页面级广告特征探测 ----
+        boolean adSignal = false;
+        if (r.shakeAware) {
+            int[] probe = new int[]{MAX_NODES / 2};
+            for (int i = 0; i < roots.size() && !adSignal; i++) {
+                adSignal = hasAdSignal(roots.get(i), r, probe);
+            }
+        }
+
+        // ---- 第 2 趟：收集候选 ----
         int[] budget = new int[]{MAX_NODES};
 
         for (int i = 0; i < roots.size(); i++) {
@@ -443,9 +476,50 @@ final class SkipEngine {
                 w = sizes.get(i)[0];
                 h = sizes.get(i)[1];
             }
-            collect(roots.get(i), w, h, r, pkg, cands, budget);
+            collect(roots.get(i), w, h, r, pkg, cands, budget, adSignal);
         }
         return pickBest(cands);
+    }
+
+    /**
+     * 判断这棵窗口树里有没有「摇一摇广告」的特征文案。
+     *
+     * 只看文字与 contentDescription，不产生任何候选 —— 它的唯一作用是
+     * 让后续的安全判定知道「这确实是广告页」。因此宁可漏判（不放宽、
+     * 回到 v3.0 的保守行为），也不误判（否则等于凭空放宽防线）。
+     */
+    static boolean hasAdSignal(AccessibilityNodeInfo root, RuleStore.Rules r, int[] budget) {
+        if (root == null || r.adTexts.isEmpty()) return false;
+
+        List<AccessibilityNodeInfo> stack = new ArrayList<AccessibilityNodeInfo>();
+        stack.add(root);
+
+        while (!stack.isEmpty() && budget[0] > 0) {
+            AccessibilityNodeInfo n = stack.remove(stack.size() - 1);
+            if (n == null) continue;
+            budget[0]--;
+
+            try {
+                if (r.isAdSignal(norm(n.getText()))) return true;
+                if (r.isAdSignal(norm(n.getContentDescription()))) return true;
+            } catch (Throwable ignored) {
+            }
+
+            int c = 0;
+            try {
+                c = n.getChildCount();
+            } catch (Throwable ignored) {
+            }
+            for (int i = c - 1; i >= 0; i--) {
+                AccessibilityNodeInfo ch = null;
+                try {
+                    ch = n.getChild(i);
+                } catch (Throwable ignored) {
+                }
+                if (ch != null) stack.add(ch);
+            }
+        }
+        return false;
     }
 
     static String shortId(String viewId) {
