@@ -496,9 +496,16 @@ final class RuleStore {
 
             // ---- 走到这里说明前台应用确实变了 ----
 
-            // 正在观察中：不接管、不重启。继续观察原来那个应用，
-            // 靠多窗口扫描去覆盖广告窗口，避免把观察窗口拖到正常界面上。
-            if (ctx.watchingPkg != null) return FG_KEEP;
+            // 正在观察中：区分两种「别的包名」——
+            //  · 用户真的离开了应用（回到桌面/设置/系统UI 等排除名单内的包）：
+            //    立即结束观察，绝不在后台或后续界面上继续点。这正是不少用户反馈的
+            //    「退出以后会反复点回去」的根因：人已经走了，观察窗口却还挂着。
+            //  · 广告 SDK 的独立窗口（不在排除名单）：保持锚定在原来那个应用上，
+            //    靠多窗口扫描去覆盖它，避免把观察窗口拖到正常界面上。
+            if (ctx.watchingPkg != null) {
+                if (!shouldWatch(pkg)) return FG_LEAVE;
+                return FG_KEEP;
+            }
 
             // 没在观察，而且新应用也不需要监听（桌面/设置/系统UI）：
             // 什么都不做；Service 会记下「见过系统窗口」。
@@ -522,6 +529,7 @@ final class RuleStore {
         static final int FG_SWITCH = 2;  // 结束旧观察，改监听新应用（v3.0 起不再用于自动接管）
         static final int FG_START = 3;   // 当前没在观察，开始监听新应用
         static final int FG_IGNORE = 4;  // 什么都不做
+        static final int FG_LEAVE = 5;   // 用户已离开应用（回到桌面/设置/系统UI），立即结束观察（v3.3）
 
         /** 组合该应用生效的文字规则。 */
         List<String> textsFor(String pkg) {

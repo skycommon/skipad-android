@@ -64,8 +64,8 @@ $srcMain  = "$root\app\src\main"
 if (-not (Test-Path "$srcMain\AndroidManifest.xml")) { Die "缺少 AndroidManifest.xml：$srcMain" }
 
 $pkgName     = "com.lbx.skipad"
-$versionCode = "6"
-$versionName = "3.2"
+$versionCode = "7"
+$versionName = "3.3"
 $minSdk      = "24"
 $targetSdk   = "34"
 $ksPass      = "skipad123"

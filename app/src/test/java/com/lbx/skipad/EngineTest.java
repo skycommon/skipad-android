@@ -350,10 +350,13 @@ public class EngineTest {
         eq("观察中+广告SDK窗口 -> FG_KEEP",
                 r.decideForeground(adsdk, ctx(qq, qq, null, 0, 1_000_000L, false, 1_000_000L)),
                 RuleStore.Rules.FG_KEEP);
-        eq("观察中+桌面 -> FG_KEEP",
+        eq("观察中+桌面 -> FG_LEAVE（v3.3 用户已离开，立即停止）",
                 r.decideForeground("com.miui.home", ctx(qq, qq, null, 0, 1_000_000L, false, 1_000_000L)),
-                RuleStore.Rules.FG_KEEP);
-        eq("观察中+另一个应用 -> FG_KEEP（不换锚点）",
+                RuleStore.Rules.FG_LEAVE);
+        eq("观察中+设置 -> FG_LEAVE",
+                r.decideForeground("com.android.settings", ctx(qq, qq, null, 0, 1_000_000L, false, 1_000_000L)),
+                RuleStore.Rules.FG_LEAVE);
+        eq("观察中+另一个应用 -> FG_KEEP（广告SDK窗口不换锚点，继续观察）",
                 r.decideForeground("com.tencent.mm", ctx(qq, qq, null, 0, 1_000_000L, false, 1_000_000L)),
                 RuleStore.Rules.FG_KEEP);
 

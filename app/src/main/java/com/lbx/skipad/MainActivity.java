@@ -93,7 +93,7 @@ public class MainActivity extends android.app.Activity {
         root.addView(t);
 
         TextView s = new TextView(this);
-        s.setText("v3.1 · 防误触 · 摇一摇广告 · 多窗口扫描 · 本地运行 · 不联网");
+        s.setText("v3.3 · 退出即停 · 首屏切走收手 · 防误触 · 摇一摇广告 · 多窗口扫描");
         s.setTextSize(13);
         s.setTextColor(C_SUB);
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(

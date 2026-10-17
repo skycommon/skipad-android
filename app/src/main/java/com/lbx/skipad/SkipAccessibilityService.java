@@ -72,6 +72,18 @@ public class SkipAccessibilityService extends AccessibilityService {
     /** 是否已排入一次主动轮询。 */
     private boolean pollScheduled = false;
 
+    // ---------------- v3.3：首屏已切走即收手 ----------------
+
+    /**
+     * 观察开始后抓到的「首屏文字指纹」（开屏广告最可能还在屏幕上的那一瞬）。
+     * 用于在观察窗口内判断「界面是不是已经切到正常页面了」——
+     * 如果整段观察都没命中任何候选，而当前界面和首屏文字已经差很远，
+     * 说明用户已经正常进入/离开应用，没必要继续扫、继续点，及时收工。
+     */
+    private String firstScreenFingerprint = null;
+    /** 是否已经触发过「首屏切走」收工，避免重复判断。 */
+    private boolean leftFirstScreen = false;
+
     // ---------------- v3.0 防误触状态 ----------------
 
     /** 上一次认定的前台应用包名，用于区分「真切换应用」和「应用内换界面」。 */
@@ -254,6 +266,13 @@ public class SkipAccessibilityService extends AccessibilityService {
             endWatch(false);
         }
 
+        // v3.3：用户已离开应用（回到桌面/设置等）。立即收工，绝不在后台继续扫、继续点，
+        // 否则会出现「退出以后又反复点回去」的现象（人走了，观察窗口还挂着）。
+        if (action == RuleStore.Rules.FG_LEAVE && watchPkg != null) {
+            Log.i(TAG, "用户已离开 " + watchPkg + "，结束观察");
+            endWatch(false);
+        }
+
         watchPkg = pkg;
         watchStart = now;
         // 观察窗口取「开屏期」和用户配置的 maxWaitMs 中较小者：
@@ -264,6 +283,8 @@ public class SkipAccessibilityService extends AccessibilityService {
         skippedOnce = false;
         blindTried = false;
         diagCapturedEarly = false;
+        firstScreenFingerprint = null;
+        leftFirstScreen = false;
         // 新一轮观察开始，重置「期间是否回过系统界面」的标记。
         // 这个标记是给**本轮结束后**的冷却判断用的：必须在这里清掉，
         // 否则一旦用户回过桌面它就永远是 true，冷却逻辑将永久失效
@@ -437,6 +458,26 @@ public class SkipAccessibilityService extends AccessibilityService {
             return;
         }
 
+        // ---- v3.3：首屏已切走即收手 ----
+        // 抓「首屏文字指纹」：在观察刚开始、广告最可能在屏幕上时记一次。
+        if (firstScreenFingerprint == null && (now - watchStart) <= 3000L) {
+            firstScreenFingerprint = fingerprintWindows(roots);
+        }
+        // 整段观察还没命中任何候选、且当前界面和首屏文字已经差很远，
+        // 说明用户已经正常进入/离开应用（不是卡在开屏广告上了），
+        // 没必要继续扫、继续点，及时收工，避免「应用内导航被当成广告反复点」。
+        if (best == null && firstScreenFingerprint != null && !leftFirstScreen
+                && (now - watchStart) > 1500L) {
+            String cur = fingerprintWindows(roots);
+            if (!firstScreenFingerprint.equals(cur) && diffRatio(firstScreenFingerprint, cur) >= 0.5) {
+                leftFirstScreen = true;
+                lastScanReason = "首屏已切走，停止本轮观察（界面与开屏差异过大）";
+                Log.i(TAG, lastScanReason);
+                endWatch(false);
+                return;
+            }
+        }
+
         // ------------------------------------------------------------------
         // v3.0 稳健模式的安全闸门。
         //
@@ -564,6 +605,59 @@ public class SkipAccessibilityService extends AccessibilityService {
             }
         } catch (Throwable ignored) {
         }
+    }
+
+    // ------------------------------------------------------------------ 首屏指纹
+
+    /**
+     * 取一组窗口根节点的「文字指纹」：所有可见文字节点去空白后拼成的集合串。
+     * 仅用于 v3.3 的「首屏是否已切走」判断，不求精确，只要能反映界面大变即可。
+     */
+    private static String fingerprintWindows(List<AccessibilityNodeInfo> roots) {
+        java.util.Set<String> set = new java.util.TreeSet<String>();
+        if (roots != null) {
+            for (AccessibilityNodeInfo rt : roots) {
+                collectFingerprint(rt, set);
+            }
+        }
+        StringBuilder sb = new StringBuilder();
+        for (String s : set) sb.append(s).append('\n');
+        return sb.toString();
+    }
+
+    private static void collectFingerprint(AccessibilityNodeInfo n, java.util.Set<String> set) {
+        if (n == null) return;
+        CharSequence t = null;
+        try { t = n.getText(); } catch (Throwable ignored) {}
+        if (t != null && t.length() > 0) {
+            StringBuilder c = new StringBuilder();
+            for (int i = 0; i < t.length(); i++) {
+                char ch = t.charAt(i);
+                if (!Character.isWhitespace(ch)) c.append(ch);
+            }
+            if (c.length() > 0) set.add(c.toString());
+        }
+        try {
+            int cnt = n.getChildCount();
+            for (int i = 0; i < cnt; i++) {
+                collectFingerprint(n.getChild(i), set);
+            }
+        } catch (Throwable ignored) {}
+    }
+
+    /** 两个指纹串的「新增/消失」比例（取较大差异除以较小行数），用于判断是否大变。 */
+    private static double diffRatio(String a, String b) {
+        String[] la = a.split("\n", -1);
+        String[] lb = b.split("\n", -1);
+        java.util.Set<String> sa = new java.util.HashSet<String>(java.util.Arrays.asList(la));
+        java.util.Set<String> sb = new java.util.HashSet<String>(java.util.Arrays.asList(lb));
+        int onlyA = 0, onlyB = 0;
+        for (String s : sa) if (!sb.contains(s)) onlyA++;
+        for (String s : sb) if (!sa.contains(s)) onlyB++;
+        int total = onlyA + onlyB;
+        int base = Math.min(sa.size(), sb.size());
+        if (base == 0) return total > 0 ? 1.0 : 0.0;
+        return (double) total / base;
     }
 
     // ------------------------------------------------------------------ 诊断快照
