@@ -412,8 +412,13 @@ public class EngineTest {
                         + "\"safeTopBand\":0.30,\"safeBottomBand\":0.75},"
                         + "\"skipTexts\":[\"跳过\"],\"strongTexts\":[\"跳过\"]}");
         eq("safeMode 默认开", r.safeMode, true);
-        eq("splashWindowMs 默认 6000", r.splashWindowMs, 6000);
-        eq("episodeCooldownMs 默认 60000", r.episodeCooldownMs, 60000);
+        // v3.4：6s 太短了。开屏广告的真实时序是「App 自己的启动页 -> SDK 拉素材 ->
+        // 广告才盖上来」，实测常要 8~12 秒。窗口一收，之后广告显示多久都没人管，
+        // 表现就是「卡在启动界面进不去」。
+        eq("splashWindowMs 默认 12000（v3.4 由 6000 放宽）", r.splashWindowMs, 12000);
+        // v3.4：冷却从 60s 降到 8s。原来的 60s 意味着「开机那一下没跳成，
+        // 之后一分钟内怎么开都不跳」，是「开机以后跳广告不起作用」的直接观感来源。
+        eq("episodeCooldownMs 默认 8000（v3.4 由 60000 收紧）", r.episodeCooldownMs, 8000);
         eq("verifyBeforeTap 默认开", r.verifyBeforeTap, true);
         check("safeMaxArea 默认 0.12", Math.abs(r.safeMaxArea - 0.12) < 1e-9);
 
@@ -603,6 +608,71 @@ public class EngineTest {
         check("skipTexts 含 点击关闭", r.skipTexts.contains("点击关闭"));
         check("skipIds 含 开屏关闭 *:splash_close*", r.skipIds.contains("*:*splash_close*"));
 
+        // ================================================================
+        // v3.4 自救参数
+        // ================================================================
+        System.out.println("== v3.4 新增参数默认值 ==");
+        eq("fgPollMs 默认 700", r.fgPollMs, 700);
+        eq("firstScreenExit 默认关", r.firstScreenExit, false);
+        eq("unsafeRejectLimit 默认 3", r.unsafeRejectLimit, 3);
+        eq("backKeyFallback 默认开", r.backKeyFallback, true);
+        eq("backKeyDelayMs 默认 3500", r.backKeyDelayMs, 3500);
+
+        System.out.println("== v3.4 新增参数钳制 ==");
+        // 每条都得有界：fgPollMs 太小会把 CPU 拉满、太大则等于没有看门狗。
+        RuleStore.Rules clamp34 = RuleStore.parse(
+                "{\"global\":{\"fgPollMs\":1,\"unsafeRejectLimit\":999,"
+                        + "\"backKeyDelayMs\":1,\"firstScreenExit\":true},"
+                        + "\"skipTexts\":[\"跳过\"],\"strongTexts\":[\"跳过\"]}");
+        eq("fgPollMs 下限 150", clamp34.fgPollMs, 150);
+        eq("unsafeRejectLimit 上限 20", clamp34.unsafeRejectLimit, 20);
+        eq("backKeyDelayMs 下限 800", clamp34.backKeyDelayMs, 800);
+        eq("firstScreenExit 可显式打开", clamp34.firstScreenExit, true);
+        RuleStore.Rules clamp34b = RuleStore.parse(
+                "{\"global\":{\"fgPollMs\":99999,\"unsafeRejectLimit\":0,"
+                        + "\"backKeyDelayMs\":99999},"
+                        + "\"skipTexts\":[\"跳过\"],\"strongTexts\":[\"跳过\"]}");
+        eq("fgPollMs 上限 3000", clamp34b.fgPollMs, 3000);
+        eq("unsafeRejectLimit 下限 1", clamp34b.unsafeRejectLimit, 1);
+        eq("backKeyDelayMs 上限 20000", clamp34b.backKeyDelayMs, 20000);
+
+        System.out.println("== v3.4 冷却只对「上一轮真跳成了」生效 ==");
+        // 这是「开机那一下没跳成，之后怎么开都不跳」的根因：
+        // v3.3 的冷却完全不看上一轮成没成，于是一次失败会锁死 60 秒。
+        // 先证明原冷却仍在（上一轮跳成功过 -> 冷却生效）：
+        eq("上一轮跳成 + 冷却内 -> FG_IGNORE（v3.3 行为保留）",
+                r.decideForeground(dy, ctxHit(null, qq, dy, 5_000L, 10_000L, false, true, 12_000L)),
+                RuleStore.Rules.FG_IGNORE);
+        // 再看 v3.4 的修复：同样在冷却时间内，但上一轮没跳成 -> 必须允许立刻重来。
+        eq("上一轮没跳成 + 冷却内 -> FG_START（v3.4 修复）",
+                r.decideForeground(dy, ctxMiss(null, qq, dy, 5_000L, 10_000L, false, 12_000L)),
+                RuleStore.Rules.FG_START);
+        // 上一轮没跳成，且用户回过桌面 -> 同样允许
+        eq("上一轮没跳成 + 回过桌面 -> FG_START",
+                r.decideForeground(dy, ctxMiss(null, "com.miui.home", dy, 5_000L, 10_000L, true, 12_000L)),
+                RuleStore.Rules.FG_START);
+
+        System.out.println("== v3.4 开屏广告角标识别（超级课程表/京东那类） ==");
+        // 用户截图里右上角写的就是「互动广告」，这是判定「这确实是广告页」的最强依据，
+        // 也是卡住自救（按返回键）的唯一前置条件 —— 没有它，在普通界面上按返回
+        // 等于帮用户退出应用。
+        check("adTexts 含 互动广告", r.adTexts.contains("互动广告"));
+        check("命中「互动广告」", r.isAdSignal("互动广告"));
+        check("命中「互动广告 跳过」", r.isAdSignal("互动广告 跳过"));
+        // 刻意不收「广告」这个裸词：正常页面标题/正文里太常见，一放宽就会误触。
+        check("adTexts 不含裸词「广告」", !r.adTexts.contains("广告"));
+        check("不把「广告位招租」误当开屏广告页", !r.isAdSignal("广告位招租"));
+
+        System.out.println("== v3.4 超级课程表单独规则 ==");
+        check("超级课程表有单独配置", r.apps.containsKey("com.tencent.pocket"));
+        eq("超级课程表显示名", r.nameOf("com.tencent.pocket"), "超级课程表");
+        check("超级课程表可监听", r.shouldWatch("com.tencent.pocket"));
+        check("超级课程表未被排除", !r.isExcludedWindow("com.tencent.pocket", null));
+
+        System.out.println("== v3.4 skipIds 补倒计时角标 ==");
+        check("skipIds 含 *:*countdown*", r.skipIds.contains("*:*countdown*"));
+        check("skipIds 含 *:*ad_time*", r.skipIds.contains("*:*ad_time*"));
+
 
         System.out.println();
         System.out.println("========================");
@@ -611,17 +681,39 @@ public class EngineTest {
         if (fail > 0) System.exit(1);
     }
 
-    /** 构造 decideForeground 的上下文（参数顺序：watching/lastFg/lastEp/endMs/sawSys/now）。 */
+    /**
+     * 构造 decideForeground 的上下文（参数顺序：watching/lastFg/lastEp/endMs/sawSys/now）。
+     *
+     * 默认 lastEpisodeHit=true —— 即「上一轮确实跳成功过」。
+     * 这是 v3.3 及以前的隐含语义（当时没有这个字段，冷却只看时间 + 有没有回过桌面），
+     * 用它做默认值可以让全部 v3.0~v3.3 的冷却用例原样保留、语义不变。
+     * v3.4 新增的「上一轮没跳成 -> 不冷却」请用 {@link #ctxMiss} 单独验证。
+     */
     private static RuleStore.Rules.FgContext ctx(String watching, String lastFg, String lastEp,
                                                 long endMs, long lastEndMs, boolean sawSys, long now) {
+        return ctxHit(watching, lastFg, lastEp, endMs, lastEndMs, sawSys, true, now);
+    }
+
+    /** 同上，但可指定「上一轮是否真的跳成功过」。 */
+    private static RuleStore.Rules.FgContext ctxHit(String watching, String lastFg, String lastEp,
+                                                    long endMs, long lastEndMs, boolean sawSys,
+                                                    boolean lastHit, long now) {
         RuleStore.Rules.FgContext c = new RuleStore.Rules.FgContext();
         c.watchingPkg = watching;
         c.lastFgPkg = lastFg;
         c.lastEpisodePkg = lastEp;
         c.lastEpisodeEndMs = lastEndMs;
         c.sawSystemSinceEpisode = sawSys;
+        c.lastEpisodeHit = lastHit;
         c.now = now;
         return c;
+    }
+
+    /** 上一轮观察没跳成（lastEpisodeHit=false）的上下文。 */
+    private static RuleStore.Rules.FgContext ctxMiss(String watching, String lastFg, String lastEp,
+                                                     long endMs, long lastEndMs, boolean sawSys,
+                                                     long now) {
+        return ctxHit(watching, lastFg, lastEp, endMs, lastEndMs, sawSys, false, now);
     }
 
     /**

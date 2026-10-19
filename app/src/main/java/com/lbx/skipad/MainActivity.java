@@ -93,7 +93,7 @@ public class MainActivity extends android.app.Activity {
         root.addView(t);
 
         TextView s = new TextView(this);
-        s.setText("v3.3 · 退出即停 · 首屏切走收手 · 防误触 · 摇一摇广告 · 多窗口扫描");
+        s.setText("v3.4 · 开机即生效 · 卡住自救 · 12 秒观察窗口 · 防误触 · 摇一摇广告 · 多窗口扫描");
         s.setTextSize(13);
         s.setTextColor(C_SUB);
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
@@ -246,6 +246,23 @@ public class MainActivity extends android.app.Activity {
                     }
                 }));
 
+        card.addView(divider());
+
+        // v3.4：卡住自救。专治「卡在开屏广告上，进不去也退不出」。
+        // 为什么值得做成默认开：广告 SDK 把开屏页的返回键重写成了「结束广告」，
+        // 所以按返回对用户等价于跳过；而万一不等价，也至少让人能退出去。
+        // 安全性来自前置条件 —— 只有先确认这一屏确实是广告页（有「互动广告」
+        // 这类措辞）才会动手，普通界面绝不会按返回。
+        card.addView(switchRow("卡住自救（按返回键）",
+                "开屏广告怎么都跳不掉时，等一会儿自动按一次返回键。仅在确认是广告页时生效",
+                isBackKeyFallback(), new OnChecked() {
+                    @Override
+                    public void onChecked(boolean v) {
+                        setGlobalBool("backKeyFallback", v);
+                        refreshStatus();
+                    }
+                }));
+
         root.addView(card);
     }
 
@@ -327,8 +344,15 @@ public class MainActivity extends android.app.Activity {
                 "1. 用数据线或传输工具把 APK 装到手机（需允许“安装未知应用”）。\n\n"
                         + "2. 打开本应用，点“打开无障碍设置”，在其中找到“跳过广告”并开启。\n\n"
                         + "3. 部分手机（小米/华为/OPPO/vivo）还需要在“电池优化”或“后台管理”里"
-                        + "把本应用设为不受限制，服务才不会被系统杀掉。\n\n"
+                        + "把本应用设为不受限制，并在“自启动”里允许它，服务开机后才不会被系统杀掉。\n\n"
                         + "4. 之后正常打开其他应用，开屏广告出现时会自动点掉。\n\n"
+                        + "v3.4 说明：不再只等系统通知。服务会自己每隔不到一秒看一眼当前是哪个应用，"
+                        + "所以手机刚开机、系统没发出任何通知的那段时间也照样能跳。"
+                        + "开屏广告的观察窗口放宽到 12 秒，足够覆盖“启动页 → 广告盖上来”的全过程。\n\n"
+                        + "卡住自救：如果确认当前是广告页（有“互动广告 / 摇一摇”这类字样），"
+                        + "却一直找不到“跳过”按钮，等 3.5 秒会自动按一次返回键结束广告 —— "
+                        + "广告页的返回等价于跳过，也让你不至于卡在开屏界面既进不去也退不出。"
+                        + "普通界面绝不会触发。\n\n"
                         + "原理与安全：本应用只在你打开某个应用后的最初几秒内读取当前界面，"
                         + "寻找写着“跳过 / 跳过广告 / Skip”之类的按钮并点击；"
                         + "超时或进入正常界面后立即停止，不会读取输入框，也不联网。");
@@ -366,8 +390,12 @@ public class MainActivity extends android.app.Activity {
             sb.append("单独配置：").append(r.apps.size()).append(" 个\n");
             sb.append("摇一摇广告放宽：").append(r.shakeAware ? "开" : "关")
               .append("（特征词 ").append(r.adTexts.size()).append(" 条）\n");
-            sb.append("观察窗口：").append(r.maxWaitMs / 1000).append(" 秒 · 扫描间隔 ")
-                    .append(r.scanIntervalMs).append(" 毫秒");
+            sb.append("观察窗口：").append(r.splashWindowMs / 1000).append(" 秒 · 扫描间隔 ")
+                    .append(r.scanIntervalMs).append(" 毫秒\n");
+            sb.append("前台轮询：").append(r.fgPollMs).append(" 毫秒")
+              .append("（观察期自动减半）· 冷却 ").append(r.episodeCooldownMs / 1000).append(" 秒\n");
+            sb.append("卡住自救：").append(r.backKeyFallback ? "开" : "关")
+              .append("（确认广告页后 ").append(r.backKeyDelayMs).append(" 毫秒按返回）");
             ruleSummary.setText(sb.toString());
         } catch (Throwable t) {
             ruleSummary.setText("规则读取失败：" + t.getMessage());
@@ -625,6 +653,23 @@ public class MainActivity extends android.app.Activity {
             JSONObject root = new JSONObject(RuleStore.getRawJson(this));
             JSONObject g = root.optJSONObject("global");
             return g == null || g.optBoolean("verifyBeforeTap", true);
+        } catch (Throwable t) {
+            return true;
+        }
+    }
+
+    /**
+     * 卡住自救（按返回键，默认开）。
+     *
+     * 只在「已确认是广告页」且「等够了 backKeyDelayMs 仍跳不掉」时才动手，
+     * 所以默认值给的是开 —— 关掉它，用户就只能干等着广告自己结束，
+     * 而「卡在开屏界面进不去也退不出」正是这么来的。
+     */
+    private boolean isBackKeyFallback() {
+        try {
+            JSONObject root = new JSONObject(RuleStore.getRawJson(this));
+            JSONObject g = root.optJSONObject("global");
+            return g == null || g.optBoolean("backKeyFallback", true);
         } catch (Throwable t) {
             return true;
         }

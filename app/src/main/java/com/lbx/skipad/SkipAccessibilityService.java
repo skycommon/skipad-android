@@ -1,11 +1,14 @@
 package com.lbx.skipad;
 
 import android.accessibilityservice.AccessibilityService;
+import android.accessibilityservice.AccessibilityServiceInfo;
 import android.content.Context;
 import android.graphics.Rect;
 import android.os.Build;
 import android.os.Handler;
+import android.os.HandlerThread;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.os.VibrationEffect;
 import android.os.Vibrator;
 import android.text.TextUtils;
@@ -25,17 +28,43 @@ import java.util.List;
 import java.util.Locale;
 
 /**
- * 开屏广告跳过服务（v2）。
+ * 开屏广告跳过服务（v3.4）。
  *
- * v1 的主要缺陷：只用 getRootInActiveWindow() 扫「当前活动窗口」。
- * 但开屏广告经常由广告 SDK 渲染在**独立窗口**（甚至多个窗口）里，
- * 不在活动窗口的节点树内，于是永远扫不到 —— 这就是 QQ音乐 之类跳不掉的原因。
- * v2 改用 getWindows() 遍历全部窗口。
+ * v1：只用 getRootInActiveWindow()，广告 SDK 的独立窗口扫不到。
+ * v2：改用 getWindows() 遍历全部窗口，并给候选打分。
+ * v3.0~v3.3：稳健模式、摇一摇放宽、身份确认、离开应用即收手。
  *
- * 其它 v2 改进：
- *  - 候选打分挑最优，而不是命中第一个就点；
- *  - 点完不复位观察窗口，持续到超时，能处理「广告分两段」的情况；
- *  - 未命中且开启诊断时，抓一份窗口树摘要存本地，便于精确定位规则。
+ * v3.4 修的三件事（对应两条真实反馈）：
+ *
+ * ① 「开机以后跳不过广告了」
+ *    根因 A：整套逻辑**完全靠无障碍事件驱动**。开机后系统拉起服务的那一刻，
+ *            事件流常常是「静默」的（服务绑定的时机早于界面渲染，或者 ROM 把
+ *            首批事件吞了），于是一整局游戏里一个事件都没有 —— 界面照旧、扫描不跑。
+ *            修法：加一条**主动前台轮询**（fgPollMs，默认 700ms），
+ *            直接读活动窗口的包名来判断「是不是有应用起来了」。
+ *            从此跳广告不再依赖任何事件，只剩「广告在不在屏幕上」这一件事。
+ *    根因 B：服务刚连上时没有重新登记能力。部分 ROM 在开机重启后会带着上次的
+ *            AccessibilityServiceInfo 空壳起来（事件类型/flags 丢失）。
+ *            修法：连接时 setServiceInfo(getServiceInfo()) 重新登记，并在 1.5 秒后再来一次。
+ *
+ * ② 「卡在超级课程表的启动界面，进不去也退不出」
+ *    根因 A：开屏窗口只有 6 秒，而「App 自己的启动页 → 广告 SDK 拉素材 → 广告盖上来」
+ *            常常要 8~12 秒。观察窗口一收，之后广告显示多久都没人管。
+ *            修法：splashWindowMs 默认 6s → 12s。
+ *    根因 B：v3.3 的「首屏切走即收手」把上面这个过程读反了 ——
+ *            启动页和广告页文字差异极大，被判成「用户已经走了」，立刻收工。
+ *            修法：默认关闭该判断（firstScreenExit=false）。
+ *    根因 C：退出应用（FG_LEAVE）后没有 return，会顺手在**桌面**上重开一轮观察，
+ *            既可能误点桌面图标，又让「离开即停」形同虚设。
+ *            修法：FG_LEAVE 直接 return。
+ *    根因 D：跳过按钮是纯图片/视频覆盖层时，无障碍树里啥都没有，只能干等。
+ *            修法：确认是广告页（有「互动广告/摇一摇」等措辞）且卡满 backKeyDelayMs
+ *            仍没跳掉，执行一次系统返回键 —— 广告页的返回等价于「跳过」，
+ *            这也是「退不出」的唯一出路。
+ *
+ * ③ 顺带修的性能问题：扫描原本全在**主线程**（100ms 一次 + 250ms 轮询 + 点击前
+ *    双次全树复核），低端机上把主线程占满，表现为「界面卡住、点了没反应」。
+ *    v3.4 把所有扫描与点击搬到独立 worker 线程，主线程只负责收事件、投递任务。
  */
 public class SkipAccessibilityService extends AccessibilityService {
 
@@ -45,11 +74,24 @@ public class SkipAccessibilityService extends AccessibilityService {
     /** 供界面查询服务是否已连接。 */
     private static volatile SkipAccessibilityService instance;
 
-    private final Handler handler = new Handler(Looper.getMainLooper());
+    /** 主线程：只做 Toast / 震动这类必须回到 UI 线程的事。 */
+    private final Handler main = new Handler(Looper.getMainLooper());
+
+    /** worker 线程：所有读窗口、扫描、点击、状态判断都在这里。 */
+    private HandlerThread workerThread;
+    private volatile Handler worker;
+
+    /** 供界面查询的状态快照（worker 写，主线程读，仅用于显示）。 */
+    private volatile String snapWatchPkg = null;
+    private volatile String snapReason = null;
 
     private RuleStore.Rules rules;
 
-    // 当前观察窗口状态
+    // ------------------------------------------------------------------
+    // 观察窗口状态。全部只在 worker 线程读写，因此不需要加锁 —— 这是把状态机
+    // 收敛到单线程带来的好处之一（v3.3 里事件与定时器会并发改这些字段）。
+    // ------------------------------------------------------------------
+
     private String watchPkg = null;
     private long watchStart = 0L;
     private long watchDeadline = 0L;
@@ -65,23 +107,19 @@ public class SkipAccessibilityService extends AccessibilityService {
      * 本次观察里是否已经抓过「开屏首批界面」快照。
      *
      * 为什么要在第一次扫描时就抓：开屏广告通常只显示 3~5 秒，
-     * 而观察窗口是 15 秒 —— 等到超时才抓，广告早就消失了，
+     * 而观察窗口更长 —— 等到超时才抓，广告早就消失了，
      * 抓到的只是 App 主界面，对排查毫无帮助。
      */
     private boolean diagCapturedEarly = false;
     /** 是否已排入一次主动轮询。 */
     private boolean pollScheduled = false;
 
-    // ---------------- v3.3：首屏已切走即收手 ----------------
+    /** 上一次扫描的简述，用于诊断。 */
+    private String lastScanReason = null;
 
-    /**
-     * 观察开始后抓到的「首屏文字指纹」（开屏广告最可能还在屏幕上的那一瞬）。
-     * 用于在观察窗口内判断「界面是不是已经切到正常页面了」——
-     * 如果整段观察都没命中任何候选，而当前界面和首屏文字已经差很远，
-     * 说明用户已经正常进入/离开应用，没必要继续扫、继续点，及时收工。
-     */
+    // ---------------- v3.3：首屏指纹（v3.4 起默认不生效，见 firstScreenExit） ----------------
+
     private String firstScreenFingerprint = null;
-    /** 是否已经触发过「首屏切走」收工，避免重复判断。 */
     private boolean leftFirstScreen = false;
 
     // ---------------- v3.0 防误触状态 ----------------
@@ -92,6 +130,8 @@ public class SkipAccessibilityService extends AccessibilityService {
     private String lastEpisodePkg = null;
     /** 上一次观察结束的时刻（uptimeMillis）。 */
     private long lastEpisodeEndMs = 0L;
+    /** 上一次观察结束时，是否真的跳成功过（v3.4：只有成功过才认冷却）。 */
+    private boolean lastEpisodeHit = false;
     /** 自上次观察结束后，是否出现过系统窗口（桌面/设置等）——说明用户真的离开过。 */
     private boolean sawSystemSinceEpisode = false;
 
@@ -99,20 +139,38 @@ public class SkipAccessibilityService extends AccessibilityService {
     private int screenW = 0;
     private int screenH = 0;
 
+    // ---------------- v3.4 自救状态 ----------------
+
+    /** 本轮观察里「已确认是广告页」的第一个时刻；0 表示还没确认过。 */
+    private long adPageSinceMs = 0L;
+    /** 本轮观察里是否已经按过返回键（每轮最多一次，避免连按把应用退出去）。 */
+    private boolean backKeyTried = false;
+    /** 本轮观察里因为「不安全候选」放弃过几次。 */
+    private int unsafeRejects = 0;
+    /** 前台轮询是否已排入。 */
+    private boolean fgScheduled = false;
+    /** 当前是否已做过一次连接自检。 */
+    private boolean selfCheckDone = false;
+
+    // ------------------------------------------------------------------ 任务
+
     private final Runnable scanTask = new Runnable() {
         @Override
         public void run() {
             scanScheduled = false;
-            doScan();
+            try {
+                doScan();
+            } catch (Throwable t) {
+                Log.e(TAG, "扫描异常", t);
+            }
         }
     };
 
     /**
-     * 主动轮询任务。
+     * 观察窗口内的主动轮询。
      *
      * 为什么需要它（「有时能跳、有时不行」的根因之二）：
-     * 原实现完全靠无障碍事件驱动 —— 只有收到 window 内容变化事件才扫描。
-     * 但广告若是纯图片 / 视频 / SurfaceView，渲染时可能**一个事件都不发**，
+     * 广告若是纯图片 / 视频 / SurfaceView，渲染时可能**一个事件都不发**，
      * 或者事件在广告出现的瞬间就发完了；这时我们就只扫到「广告还没出来」或
      * 「广告已经变了但没通知」的那一帧，于是漏掉。
      * 加了这个定时器后，观察窗口内会按 pollIntervalMs 周期主动扫描，
@@ -123,16 +181,38 @@ public class SkipAccessibilityService extends AccessibilityService {
         public void run() {
             pollScheduled = false;
             if (watchPkg == null) return;
-            long now = android.os.SystemClock.uptimeMillis();
+            long now = SystemClock.uptimeMillis();
             if (now > watchDeadline) {
                 endWatch(true);
                 return;
             }
-            // 不在这里判断 skippedOnce：doScan() 内部已经处理了
-            // （点掉过就 endWatch(false) 收工），交给它更不容易漏掉善后。
-            doScan();
-            // doScan 可能已经 endWatch（命中或超时），那就不要再排下一次了
+            try {
+                doScan();
+            } catch (Throwable t) {
+                Log.e(TAG, "轮询扫描异常", t);
+            }
             if (watchPkg != null) schedulePoll();
+        }
+    };
+
+    /**
+     * 前台轮询（v3.4 的核心新增）。
+     *
+     * 它解决的是「开机后服务在跑，但一个事件都收不到」：
+     * 直接读当前活动窗口的包名，自己去判断「有没有应用起来」，
+     * 完全不依赖 onAccessibilityEvent。代价是每 fgPollMs 读一次窗口根节点
+     * （只取包名，不做 DFS），远小于一次完整扫描。
+     */
+    private final Runnable fgTask = new Runnable() {
+        @Override
+        public void run() {
+            fgScheduled = false;
+            try {
+                pollForeground();
+            } catch (Throwable t) {
+                Log.e(TAG, "前台轮询异常", t);
+            }
+            scheduleFgPoll();
         }
     };
 
@@ -142,10 +222,12 @@ public class SkipAccessibilityService extends AccessibilityService {
 
     public static String statusText() {
         SkipAccessibilityService s = instance;
-        if (s == null) return "未连接";
-        if (s.watchPkg == null) return "待命中";
-        String t = "监听中：" + s.watchPkg;
-        if (s.lastScanReason != null) t += "\n最近扫描：" + s.lastScanReason;
+        if (s == null) return "未连接（请确认无障碍开关是否被系统关掉）";
+        String w = s.snapWatchPkg;
+        if (w == null) return "待命中（已就绪，打开别的应用即可）";
+        String t = "监听中：" + w;
+        String reason = s.snapReason;
+        if (reason != null) t += "\n最近扫描：" + reason;
         return t;
     }
 
@@ -155,18 +237,36 @@ public class SkipAccessibilityService extends AccessibilityService {
     protected void onServiceConnected() {
         super.onServiceConnected();
         instance = this;
-        reloadRules();
-        updateScreenSize();
+
+        startWorker();
+
+        final Handler w = worker;
+        if (w == null) return;
+        w.post(new Runnable() {
+            @Override
+            public void run() {
+                updateScreenSize();
+                reloadRules();
+                refreshServiceInfo();
+                // 部分 ROM 会在连接后的头 1~2 秒把 info 覆盖回空壳，再补一次。
+                w.postDelayed(new Runnable() {
+                    @Override
+                    public void run() {
+                        refreshServiceInfo();
+                    }
+                }, 1500L);
+                selfCheck();
+                // 立即来一次前台探测，不必等到第一次事件。
+                scheduleFgPoll(0);
+            }
+        });
         Log.i(TAG, "服务已连接");
     }
 
     @Override
     public boolean onUnbind(android.content.Intent intent) {
         instance = null;
-        handler.removeCallbacks(scanTask);
-        handler.removeCallbacks(pollTask);
-        scanScheduled = false;
-        pollScheduled = false;
+        shutdownWorker();
         Log.i(TAG, "服务已断开");
         return super.onUnbind(intent);
     }
@@ -174,8 +274,7 @@ public class SkipAccessibilityService extends AccessibilityService {
     @Override
     public void onDestroy() {
         instance = null;
-        handler.removeCallbacks(scanTask);
-        handler.removeCallbacks(pollTask);
+        shutdownWorker();
         super.onDestroy();
     }
 
@@ -183,11 +282,157 @@ public class SkipAccessibilityService extends AccessibilityService {
     public void onInterrupt() {
     }
 
+    // ------------------------------------------------------------------ 线程
+
+    private void startWorker() {
+        if (workerThread != null) return;
+        workerThread = new HandlerThread("skipad-worker");
+        workerThread.start();
+        worker = new Handler(workerThread.getLooper());
+    }
+
+    private void shutdownWorker() {
+        Handler w = worker;
+        if (w != null) {
+            w.removeCallbacksAndMessages(null);
+        }
+        worker = null;
+        HandlerThread t = workerThread;
+        workerThread = null;
+        if (t != null) {
+            try {
+                t.quitSafely();
+            } catch (Throwable ignored) {
+            }
+        }
+        scanScheduled = false;
+        pollScheduled = false;
+        fgScheduled = false;
+        watchPkg = null;
+        snapWatchPkg = null;
+    }
+
+    /**
+     * 重新登记无障碍能力。
+     *
+     * 开机后系统拉起服务的时机很早，部分 ROM 会给一个「事件类型/flags 都为空」的
+     * AccessibilityServiceInfo —— 服务在跑，却收不到任何事件，这正是
+     * 「开机以后就不灵了，重启一下服务又好了」的成因。把当前 info 原样写回，
+     * 等于让系统按 xml 配置重新登记一次监听。
+     */
+    private void refreshServiceInfo() {
+        try {
+            AccessibilityServiceInfo info = getServiceInfo();
+            if (info != null) setServiceInfo(info);
+            Log.i(TAG, "无障碍能力已重新登记");
+        } catch (Throwable t) {
+            Log.e(TAG, "重新登记无障碍能力失败", t);
+        }
+    }
+
+    /**
+     * 连接自检：把「服务确实起来了」这件事写进日志，并把主开关状态也记下来。
+     *
+     * 为什么值得写一条日志：用户说「开机以后跳广告不起作用」时，第一件要分辨的
+     * 就是「服务压根没起来」还是「起来了但没跳成」。有了这条记录，打开
+     * 「查看日志」一眼就能分清 —— 没有这条就是系统没拉起服务（去查电池优化/自启），
+     * 有这条却仍不跳，才是规则或界面问题。
+     */
+    private void selfCheck() {
+        if (selfCheckDone) return;
+        selfCheckDone = true;
+
+        boolean master = RuleStore.isMasterEnabled(this);
+        boolean diagnose = RuleStore.isDiagnose(this);
+        String ver = "v3.4";
+        try {
+            ver = "v" + getPackageManager().getPackageInfo(getPackageName(), 0).versionName;
+        } catch (Throwable ignored) {
+        }
+        appendLog("服务自检", ver + " 已连接 · 总开关" + (master ? "开" : "关")
+                + " · 诊断" + (diagnose ? "开" : "关")
+                + " · 扫描线程就绪 · 前台轮询已启动");
+        Log.i(TAG, "自检完成");
+    }
+
+    // ------------------------------------------------------------------ 事件入口
+
     @Override
     public void onAccessibilityEvent(AccessibilityEvent event) {
         if (event == null) return;
+        if (!RuleStore.isMasterEnabled(this)) {
+            // 主开关关掉时，把还在跑的定时器也停掉，避免空转。
+            Handler w = worker;
+            if (w != null && watchPkg != null) {
+                w.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        endWatch(false);
+                    }
+                });
+            }
+            return;
+        }
 
+        final Handler w = worker;
+        if (w == null) return;
+
+        final int type = event.getEventType();
+        CharSequence pn = null;
+        try {
+            pn = event.getPackageName();
+        } catch (Throwable ignored) {
+        }
+        final String pkg = pn == null ? null : pn.toString();
+
+        if (type != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
+                && type != AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
+                && type != AccessibilityEvent.TYPE_WINDOWS_CHANGED
+                && type != AccessibilityEvent.TYPE_VIEW_SCROLLED) {
+            return;
+        }
+
+        final boolean stateChanged = type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED;
+
+        w.post(new Runnable() {
+            @Override
+            public void run() {
+                long now = SystemClock.uptimeMillis();
+                if (stateChanged && pkg != null) {
+                    handleForeground(pkg, now);
+                }
+                onEventTick(now);
+            }
+        });
+    }
+
+    /**
+     * 事件带来的「可能该扫一下」。
+     *
+     * 注意：这里**不再**自己判断超时/重试上限后就 return —— 那些判断已经由
+     * doScan() 统一处理。事件路径只负责「催一次扫描」，逻辑收敛到一处，
+     * 才不会出现「某条路径忘了判断某个上限」这类分叉 bug。
+     */
+    private void onEventTick(long now) {
         if (!RuleStore.isMasterEnabled(this)) return;
+        RuleStore.Rules r = rules;
+        if (r == null) {
+            reloadRules();
+            r = rules;
+            if (r == null) return;
+        }
+        if (watchPkg == null) return;
+        scheduleScan(now);
+    }
+
+    // ------------------------------------------------------------------ 前台判定
+
+    /** 主动读一次当前前台，喂给与事件路径相同的决策逻辑。 */
+    private void pollForeground() {
+        if (!RuleStore.isMasterEnabled(this)) return;
+
+        String pkg = readActivePkg();
+        if (pkg == null) return;
 
         RuleStore.Rules r = rules;
         if (r == null) {
@@ -196,83 +441,148 @@ public class SkipAccessibilityService extends AccessibilityService {
             if (r == null) return;
         }
 
-        final int type = event.getEventType();
-        String pkg = event.getPackageName() == null ? null : event.getPackageName().toString();
-
-        final long now = android.os.SystemClock.uptimeMillis();
-
-        if (type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED && pkg != null) {
-            onForegroundChanged(pkg, now);
+        // 广告 SDK 的覆盖窗口可能成为「活动窗口」，此时活动包名不是我们关心的应用。
+        // 不能让轮询就此放弃 —— 那正是「事件没收到、广告又盖在上面」的死角。
+        // 这时去全部窗口里找那个真正需要监听的应用包名。
+        if (!r.shouldWatch(pkg) && watchPkg == null) {
+            String owner = findWatchableWindowPkg(r);
+            if (owner != null) pkg = owner;
         }
 
-        if (watchPkg == null) return;
-        if (now > watchDeadline) {
-            // 超时收工：这里也算「自然超时」，要让 endWatch 有机会抓诊断快照。
-            // （早先传 false 会导致只要由事件路径触发超时，诊断就不会被抓。）
-            endWatch(true);
-            return;
-        }
-        // 已经点掉过一次就收工（除非用户要求继续）
-        if (skippedOnce && !r.continueAfterSkip) return;
-        if (attempts >= r.retryLimit) return;
+        handleForeground(pkg, SystemClock.uptimeMillis());
+    }
 
-        // 广告窗口可能来自别的包名（广告 SDK 独立进程），这里不再按包名过滤，
-        // 只依赖「是否处于观察窗口」这一层限制。
-        if (type == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
-                || type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
-                || type == AccessibilityEvent.TYPE_WINDOWS_CHANGED
-                || type == AccessibilityEvent.TYPE_VIEW_SCROLLED) {
-            scheduleScan(now);
+    private String readActivePkg() {
+        try {
+            AccessibilityNodeInfo root = getRootInActiveWindow();
+            if (root == null) return null;
+            CharSequence pn = root.getPackageName();
+            return pn == null ? null : pn.toString();
+        } catch (Throwable t) {
+            return null;
         }
     }
 
-    // ------------------------------------------------------------------ 观察窗口
+    /** 在全部窗口里找出第一个「需要监听」的包名（用于活动窗口是广告覆盖层的情况）。 */
+    private String findWatchableWindowPkg(RuleStore.Rules r) {
+        try {
+            List<AccessibilityWindowInfo> wins = getWindows();
+            if (wins == null) return null;
+            for (AccessibilityWindowInfo w : wins) {
+                if (w == null) continue;
+                AccessibilityNodeInfo rt = null;
+                try {
+                    rt = w.getRoot();
+                } catch (Throwable ignored) {
+                }
+                if (rt == null) continue;
+                String wp = null;
+                try {
+                    CharSequence pn = rt.getPackageName();
+                    if (pn != null) wp = pn.toString();
+                } catch (Throwable ignored) {
+                }
+                if (wp != null && r.shouldWatch(wp)) return wp;
+            }
+        } catch (Throwable ignored) {
+        }
+        return null;
+    }
 
-    private void onForegroundChanged(String pkg, long now) {
-        reloadRules();
+    private void handleForeground(String pkg, long now) {
+        if (pkg == null || pkg.isEmpty()) return;
+
+        // ---- 快路径：观察中且包名没变，什么都不用做（不必重读规则） ----
+        if (pkg.equals(watchPkg)) {
+            lastFgPkg = pkg;
+            return;
+        }
 
         RuleStore.Rules r = rules;
+        if (r == null) {
+            reloadRules();
+            r = rules;
+            if (r == null) return;
+        }
+
+        // ---- 快路径：没在观察，且前台应用没变（同一应用内换界面）----
+        // 这条是 v3.0 防误触的关键：没有它，App 内部任何窗口变化都会重开一轮观察，
+        // 于是把扫描带进正常界面（抖音的全屏搜索就是这么被误点的）。
+        if (pkg.equals(lastFgPkg) && watchPkg == null) {
+            return;
+        }
+
+        // 走到这里说明可能是一次真正的切换，先让用户刚改过的规则立刻生效。
+        reloadRules();
+        r = rules;
         if (r == null) return;
 
-        // 决策已抽成纯函数（RuleStore.Rules.decideForeground），便于单测覆盖。
-        // v3.0 的两个防误触要点都体现在这里：
-        //   · 观察一旦开始就**锚定**在原应用上，任何其它包名（含广告 SDK 窗口）
-        //     都不接管、不重启 —— 避免把观察窗口拖到正常界面上；
-        //   · 区分「真切换应用」与「同应用内换界面」，后者在没在观察时一律忽略
-        //     —— 避免开完全屏搜索又被重新扫一轮。
+        // 记录「见过系统窗口」：用户回过桌面 = 确实离开过该应用，
+        // 下次再进同一个应用就不该被冷却挡住。
+        if (!pkg.equals(watchPkg) && !r.shouldWatch(pkg)) {
+            sawSystemSinceEpisode = true;
+        }
+
+        // ------------------------------------------------------------
+        // 注意顺序：必须先把**旧**的 lastFgPkg 交给决策，再更新字段。
+        // decideForeground 用 ctx.lastFgPkg 判断「是不是同一应用内部换界面」，
+        // 如果先更新再传，那个判断永远是「相同」，于是：
+        //   · 没在观察时永远不会开始观察（怎么开应用都不跳）；
+        //   · 观察中遇到别的包名会被当成 FG_SAME 直接 return，
+        //     「离开即停」同样失效。
+        // 这个坑在 v3.3 里没有（原代码是先存 ctx 再更新），v3.4 重写时挪反了一步。
+        // ------------------------------------------------------------
         RuleStore.Rules.FgContext ctx = new RuleStore.Rules.FgContext();
         ctx.watchingPkg = watchPkg;
         ctx.lastFgPkg = lastFgPkg;
         ctx.lastEpisodePkg = lastEpisodePkg;
         ctx.lastEpisodeEndMs = lastEpisodeEndMs;
+        ctx.lastEpisodeHit = lastEpisodeHit;
         ctx.sawSystemSinceEpisode = sawSystemSinceEpisode;
         ctx.now = now;
 
         int action = r.decideForeground(pkg, ctx);
 
-        // 记录「见过系统窗口」，供冷却判断使用（用户回过桌面=确实离开过该应用）
-        if (!pkg.equals(watchPkg) && !r.shouldWatch(pkg)) {
-            sawSystemSinceEpisode = true;
-        }
-        // 更新前台应用记录（在决策之后，因为决策需要用到旧的 lastFgPkg）
+        // 决策已用掉旧值，现在才把「当前前台」记下来，供下一次比较。
         lastFgPkg = pkg;
 
-        if (action == RuleStore.Rules.FG_SAME || action == RuleStore.Rules.FG_IGNORE
-                || action == RuleStore.Rules.FG_KEEP) {
+        if (action == RuleStore.Rules.FG_SAME || action == RuleStore.Rules.FG_IGNORE) {
             return;
         }
 
-        if (action == RuleStore.Rules.FG_SWITCH && watchPkg != null) {
+        if (action == RuleStore.Rules.FG_KEEP) {
+            // 观察中遇到了别的包名（多半是广告 SDK 的独立窗口）：
+            // 不接管、不重启锚点，但界面确实变了，催一次扫描。
+            scheduleScan(now);
+            return;
+        }
+
+        if ((action == RuleStore.Rules.FG_SWITCH || action == RuleStore.Rules.FG_LEAVE)
+                && watchPkg != null) {
             endWatch(false);
         }
 
-        // v3.3：用户已离开应用（回到桌面/设置等）。立即收工，绝不在后台继续扫、继续点，
-        // 否则会出现「退出以后又反复点回去」的现象（人走了，观察窗口还挂着）。
-        if (action == RuleStore.Rules.FG_LEAVE && watchPkg != null) {
-            Log.i(TAG, "用户已离开 " + watchPkg + "，结束观察");
-            endWatch(false);
+        // ------------------------------------------------------------
+        // v3.4 关键修复：用户已离开应用（回到桌面/设置等）时**到此为止**。
+        //
+        // v3.3 这里只是 endWatch(false) 然后继续往下走，于是：
+        //   · 在**桌面**上重新开了一轮 6 秒观察；
+        //   · 桌面包名在 excludeApps 里，窗口被全部跳过，roots 为空，
+        //     兜底用 getRootInActiveWindow() 扫桌面 —— 桌面上若有像「跳过」的文字
+        //     就会被点；
+        //   · 「离开即停」这条 v3.3 的主打功能实际上从未生效过。
+        // ------------------------------------------------------------
+        if (action == RuleStore.Rules.FG_LEAVE) {
+            snapWatchPkg = null;
+            Log.i(TAG, "用户已离开，结束观察且不再重开");
+            return;
         }
 
+        // FG_START：新一轮观察。
+        startWatch(pkg, now, r);
+    }
+
+    private void startWatch(String pkg, long now, RuleStore.Rules r) {
         watchPkg = pkg;
         watchStart = now;
         // 观察窗口取「开屏期」和用户配置的 maxWaitMs 中较小者：
@@ -285,18 +595,23 @@ public class SkipAccessibilityService extends AccessibilityService {
         diagCapturedEarly = false;
         firstScreenFingerprint = null;
         leftFirstScreen = false;
+        adPageSinceMs = 0L;
+        backKeyTried = false;
+        unsafeRejects = 0;
         // 新一轮观察开始，重置「期间是否回过系统界面」的标记。
         // 这个标记是给**本轮结束后**的冷却判断用的：必须在这里清掉，
-        // 否则一旦用户回过桌面它就永远是 true，冷却逻辑将永久失效
-        // （表现为同一应用内换界面又会重开观察 —— 正是要修的误触）。
+        // 否则一旦用户回过桌面它就永远是 true，冷却逻辑将永久失效。
         sawSystemSinceEpisode = false;
         lastScan = 0L;
         lastScanReason = null;
         updateScreenSize();
 
+        snapWatchPkg = pkg;
+        snapReason = null;
+
         scheduleScan(now);
         schedulePoll();
-        Log.i(TAG, "开始监听 " + pkg);
+        Log.i(TAG, "开始监听 " + pkg + "，窗口 " + limit + "ms");
     }
 
     private void endWatch(boolean timedOut) {
@@ -308,36 +623,70 @@ public class SkipAccessibilityService extends AccessibilityService {
             diagCapturedEarly = true;
             captureDiagnostic(watchPkg, false);
         }
-        // 记下这次观察是针对哪个应用、何时结束的，供冷却判断使用
-        // （防止同一应用内很快又被重新开一轮观察，从而在正常界面上乱找按钮）。
+        // 记下这次观察是针对哪个应用、何时结束、有没有真的跳成功过，
+        // 供冷却判断使用（v3.4：只有成功过才冷却 —— 没跳成必须允许立刻重试）。
         if (watchPkg != null) {
             lastEpisodePkg = watchPkg;
-            lastEpisodeEndMs = android.os.SystemClock.uptimeMillis();
+            lastEpisodeEndMs = SystemClock.uptimeMillis();
+            lastEpisodeHit = skippedOnce;
         }
         watchPkg = null;
-        handler.removeCallbacks(scanTask);
-        handler.removeCallbacks(pollTask);
+        snapWatchPkg = null;
+        Handler w = worker;
+        if (w != null) {
+            w.removeCallbacks(scanTask);
+            w.removeCallbacks(pollTask);
+        }
         scanScheduled = false;
         pollScheduled = false;
+        adPageSinceMs = 0L;
     }
 
     private void scheduleScan(long now) {
         RuleStore.Rules r = rules;
         if (r == null || watchPkg == null) return;
+        Handler w = worker;
+        if (w == null) return;
         if (scanScheduled) return;
         long since = now - lastScan;
         long delay = since >= r.scanIntervalMs ? 0 : (r.scanIntervalMs - since);
         scanScheduled = true;
-        handler.postDelayed(scanTask, delay);
+        w.postDelayed(scanTask, delay);
     }
 
     /** 排入下一次主动轮询（与事件驱动的 scheduleScan 互补）。 */
     private void schedulePoll() {
         RuleStore.Rules r = rules;
         if (r == null || watchPkg == null) return;
+        Handler w = worker;
+        if (w == null) return;
         if (pollScheduled) return;
         pollScheduled = true;
-        handler.postDelayed(pollTask, r.pollIntervalMs);
+        w.postDelayed(pollTask, r.pollIntervalMs);
+    }
+
+    /** 排入下一次前台轮询（v3.4：与事件完全无关的看门狗）。 */
+    private void scheduleFgPoll() {
+        scheduleFgPoll(-1L);
+    }
+
+    private void scheduleFgPoll(long delayOverride) {
+        Handler w = worker;
+        if (w == null) return;
+        if (fgScheduled) return;
+        fgScheduled = true;
+        long delay;
+        if (delayOverride >= 0) {
+            delay = delayOverride;
+        } else {
+            RuleStore.Rules r = rules;
+            long interval = 700L;
+            if (r != null && r.fgPollMs > 0) interval = r.fgPollMs;
+            // 观察期内要更勤快一点：开屏广告只存在几秒，早一眼看到就早一点跳掉。
+            if (watchPkg != null) interval = Math.max(220L, interval / 2);
+            delay = interval;
+        }
+        w.postDelayed(fgTask, delay);
     }
 
     private void reloadRules() {
@@ -359,15 +708,12 @@ public class SkipAccessibilityService extends AccessibilityService {
 
     // ------------------------------------------------------------------ 扫描与点击
 
-    /** 上一次扫描的简述，用于诊断。 */
-    private String lastScanReason = null;
-
     private void doScan() {
         final RuleStore.Rules r = rules;
         if (r == null) return;
         if (watchPkg == null) return;
 
-        long now = android.os.SystemClock.uptimeMillis();
+        long now = SystemClock.uptimeMillis();
         if (now > watchDeadline) {
             endWatch(true);
             return;
@@ -458,23 +804,25 @@ public class SkipAccessibilityService extends AccessibilityService {
             return;
         }
 
-        // ---- v3.3：首屏已切走即收手 ----
+        // ---- 首屏已切走即收手（v3.4 默认关闭） ----
         // 抓「首屏文字指纹」：在观察刚开始、广告最可能在屏幕上时记一次。
-        if (firstScreenFingerprint == null && (now - watchStart) <= 3000L) {
-            firstScreenFingerprint = fingerprintWindows(roots);
-        }
-        // 整段观察还没命中任何候选、且当前界面和首屏文字已经差很远，
-        // 说明用户已经正常进入/离开应用（不是卡在开屏广告上了），
-        // 没必要继续扫、继续点，及时收工，避免「应用内导航被当成广告反复点」。
-        if (best == null && firstScreenFingerprint != null && !leftFirstScreen
-                && (now - watchStart) > 1500L) {
-            String cur = fingerprintWindows(roots);
-            if (!firstScreenFingerprint.equals(cur) && diffRatio(firstScreenFingerprint, cur) >= 0.5) {
-                leftFirstScreen = true;
-                lastScanReason = "首屏已切走，停止本轮观察（界面与开屏差异过大）";
-                Log.i(TAG, lastScanReason);
-                endWatch(false);
-                return;
+        if (r.firstScreenExit) {
+            if (firstScreenFingerprint == null && (now - watchStart) <= 3000L) {
+                firstScreenFingerprint = fingerprintWindows(roots);
+            }
+            // 整段观察还没命中任何候选、且当前界面和首屏文字已经差很远，
+            // 说明用户已经正常进入/离开应用（不是卡在开屏广告上了），
+            // 没必要继续扫、继续点，及时收工，避免「应用内导航被当成广告反复点」。
+            if (best == null && firstScreenFingerprint != null && !leftFirstScreen
+                    && (now - watchStart) > 1500L) {
+                String cur = fingerprintWindows(roots);
+                if (!firstScreenFingerprint.equals(cur) && diffRatio(firstScreenFingerprint, cur) >= 0.5) {
+                    leftFirstScreen = true;
+                    lastScanReason = "首屏已切走，停止本轮观察（界面与开屏差异过大）";
+                    Log.i(TAG, lastScanReason);
+                    endWatch(false);
+                    return;
+                }
             }
         }
 
@@ -490,19 +838,33 @@ public class SkipAccessibilityService extends AccessibilityService {
         // 宁可漏跳（老年人更容易接受「没跳」而不是「点错」），也不误触。
         // ------------------------------------------------------------------
         if (best != null && !best.safe) {
+            unsafeRejects++;
             lastScanReason = "已拦下不安全候选：" + best.reason
                     + "（面积" + Math.round(best.areaRatio * 100) + "%，纵位置"
                     + Math.round(best.ny * 100) + "%"
                     + (best.adSignal ? "，摇一摇广告页但仍在走廊内" : "") + "）";
             Log.i(TAG, lastScanReason);
-            // 不点，但也不再重试同一类候选：直接结束本轮，避免反复评估。
-            if (!r.continueAfterSkip) endWatch(false);
+            snapReason = lastScanReason;
+            // v3.4：不因第一次遇到不安全候选就整轮放弃。
+            // 广告刚渲染出来时布局还没稳定，外层多半是整屏容器；
+            // 等半秒再评估，往往就能看到真正的那个小按钮。
+            if (unsafeRejects >= r.unsafeRejectLimit && !r.continueAfterSkip) {
+                maybeBackKey(now, roots, r, false);
+                endWatch(false);
+            }
             return;
         }
 
         if (best == null) {
             lastScanReason = "未命中（窗口: " + winInfo
                     + (skippedWins > 0 ? "，已跳过 " + skippedWins + " 个排除窗口" : "") + "）";
+
+            boolean adPage = detectAdPage(roots, r);
+            if (adPage) markAdPage(now);
+            if (adPage && !lastScanReason.contains("摇一摇")) {
+                lastScanReason += "，检测到广告页特征";
+            }
+            snapReason = lastScanReason;
 
             // ------------------------------------------------------------
             // v3.1 摇一摇广告兜底。
@@ -513,20 +875,6 @@ public class SkipAccessibilityService extends AccessibilityService {
             // 默认关闭（shakeBlindTap=false）：这是全应用里唯一凭坐标猜的动作，
             // 风险最高，必须用户显式打开。
             // ------------------------------------------------------------
-            boolean adPage = false;
-            if (r.shakeAware) {
-                try {
-                    int[] probe = new int[]{SkipEngine.MAX_NODES / 2};
-                    for (int i = 0; i < roots.size() && !adPage; i++) {
-                        adPage = SkipEngine.hasAdSignal(roots.get(i), r, probe);
-                    }
-                } catch (Throwable ignored) {
-                }
-            }
-            if (adPage && !lastScanReason.contains("摇一摇")) {
-                lastScanReason += "，检测到摇一摇广告特征";
-            }
-
             if (adPage && r.shakeBlindTap && !blindTried && attempts < r.retryLimit) {
                 blindTried = true;
                 attempts++;
@@ -534,13 +882,12 @@ public class SkipAccessibilityService extends AccessibilityService {
                         r.shakeTapX, r.shakeTapY);
                 if (ok) {
                     lastScanReason = "摇一摇广告兜底点击 " + r.shakeTapX + "," + r.shakeTapY;
+                    snapReason = lastScanReason;
                 }
             }
 
-            // 抓诊断快照：趁广告还在屏幕上时抓，而不是等 15 秒超时。
+            // 抓诊断快照：趁广告还在屏幕上时抓，而不是等超时。
             // 开屏广告一般只显示 3~5 秒，等超时抓到的只会是 App 主界面。
-            // 条件：开了诊断、本次还没抓过、已经过 400ms（等广告渲染出来）、
-            //       且还在前 6 秒内（超过就认为是正常界面了）。
             if (!diagCapturedEarly && RuleStore.isDiagnose(this)
                     && (now - watchStart) >= 400L && (now - watchStart) <= 6000L) {
                 diagCapturedEarly = true;
@@ -551,13 +898,16 @@ public class SkipAccessibilityService extends AccessibilityService {
             if (!blindTried && r.blindTapEnabled && attempts < r.retryLimit) {
                 blindTried = true;
                 attempts++;
-                int w = screenW;
-                int h = screenH;
-                boolean ok = SkipEngine.tapNormalized(this, w, h, r.blindTapX, r.blindTapY);
+                boolean ok = SkipEngine.tapNormalized(this, screenW, screenH,
+                        r.blindTapX, r.blindTapY);
                 if (ok) {
                     lastScanReason = "盲点兜底 " + r.blindTapX + "," + r.blindTapY;
+                    snapReason = lastScanReason;
                 }
             }
+
+            // v3.4：确认是广告页、又怎么都跳不掉、已经卡够久 -> 按一次返回键。
+            maybeBackKey(now, roots, r, adPage);
             return;
         }
 
@@ -575,18 +925,82 @@ public class SkipAccessibilityService extends AccessibilityService {
             if (!r.continueAfterSkip) endWatch(false);
         } else {
             lastScanReason = "命中但点击失败：" + best.reason;
+            snapReason = lastScanReason;
+            // 点了却点不动（按钮不可点、被覆盖层挡住），同样要能自救。
+            boolean adPage = detectAdPage(roots, r);
+            if (adPage) markAdPage(now);
+            maybeBackKey(now, roots, r, adPage);
         }
+    }
+
+    private boolean detectAdPage(List<AccessibilityNodeInfo> roots, RuleStore.Rules r) {
+        if (!r.shakeAware || roots == null || roots.isEmpty()) return false;
+        try {
+            int[] probe = new int[]{SkipEngine.MAX_NODES / 2};
+            for (int i = 0; i < roots.size(); i++) {
+                if (SkipEngine.hasAdSignal(roots.get(i), r, probe)) return true;
+                if (probe[0] <= 0) break;
+            }
+        } catch (Throwable ignored) {
+        }
+        return false;
+    }
+
+    private void markAdPage(long now) {
+        if (adPageSinceMs == 0L) adPageSinceMs = now;
+    }
+
+    /**
+     * 「卡在开屏广告上，进不去也退不出」的最后一道自救。
+     *
+     * 触发条件全部满足才动手：
+     *   1) 用户开了 backKeyFallback（默认开）；
+     *   2) 本轮已确认这是**广告页**（页面上有互动广告/摇一摇这类措辞）——
+     *      没有这条，在正常界面上按返回就是帮用户退出应用，比不跳广告严重得多；
+     *   3) 从确认广告页算起已经卡够 backKeyDelayMs；
+     *   4) 本轮还没按过（每轮最多一次，绝不连按）。
+     *
+     * 为什么返回键有用：开屏广告的返回键行为被广告 SDK 重写成「结束广告」，
+     * 所以它对用户而言等价于「跳过」；即便不等价，也至少让用户能退出，
+     * 不至于既进不去主界面、也退不出这个界面。
+     */
+    private void maybeBackKey(long now, List<AccessibilityNodeInfo> roots,
+                              RuleStore.Rules r, boolean adPage) {
+        if (!r.backKeyFallback || backKeyTried) return;
+        if (!adPage || adPageSinceMs == 0L) return;
+        if (now - adPageSinceMs < r.backKeyDelayMs) return;
+        if (skippedOnce) return;
+
+        backKeyTried = true;
+        boolean ok = false;
+        try {
+            ok = performGlobalAction(GLOBAL_ACTION_BACK);
+        } catch (Throwable t) {
+            Log.e(TAG, "返回键兜底失败", t);
+        }
+        lastScanReason = "卡住自救：确认是广告页但 " + (now - adPageSinceMs) + "ms 内跳不掉，"
+                + (ok ? "已按返回键结束广告" : "按返回键失败");
+        snapReason = lastScanReason;
+        Log.i(TAG, lastScanReason);
+        appendLog(rules != null ? rules.nameOf(watchPkg) : String.valueOf(watchPkg), lastScanReason);
     }
 
     private void onSkipped(String pkg, String reason) {
         String app = rules != null ? rules.nameOf(pkg) : pkg;
         Log.i(TAG, "已跳过 " + app + " / " + reason);
+        snapReason = "已跳过：" + reason;
 
         if (RuleStore.isToast(this)) {
-            try {
-                Toast.makeText(this, "已跳过广告 · " + app, Toast.LENGTH_SHORT).show();
-            } catch (Throwable ignored) {
-            }
+            final String msg = "已跳过广告 · " + app;
+            main.post(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        Toast.makeText(SkipAccessibilityService.this, msg, Toast.LENGTH_SHORT).show();
+                    } catch (Throwable ignored) {
+                    }
+                }
+            });
         }
         if (RuleStore.isVibrate(this)) {
             vibrate();
@@ -611,7 +1025,7 @@ public class SkipAccessibilityService extends AccessibilityService {
 
     /**
      * 取一组窗口根节点的「文字指纹」：所有可见文字节点去空白后拼成的集合串。
-     * 仅用于 v3.3 的「首屏是否已切走」判断，不求精确，只要能反映界面大变即可。
+     * 仅用于「首屏是否已切走」判断，不求精确，只要能反映界面大变即可。
      */
     private static String fingerprintWindows(List<AccessibilityNodeInfo> roots) {
         java.util.Set<String> set = new java.util.TreeSet<String>();
@@ -677,7 +1091,7 @@ public class SkipAccessibilityService extends AccessibilityService {
             sb.append("时间: ").append(
                     new SimpleDateFormat("MM-dd HH:mm:ss", Locale.CHINA).format(new Date())).append('\n');
             sb.append("时机: ").append(early ? "开屏早期（广告应该还在屏幕上）" : "超时兜底（可能已进入主界面）")
-              .append("，距启动 ").append(android.os.SystemClock.uptimeMillis() - watchStart).append(" ms\n");
+              .append("，距启动 ").append(SystemClock.uptimeMillis() - watchStart).append(" ms\n");
 
             List<AccessibilityWindowInfo> wins = getWindows();
             int idx = 0;

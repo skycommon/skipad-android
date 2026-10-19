@@ -157,10 +157,18 @@ final class RuleStore {
             r.safeMode = g.optBoolean("safeMode", true);
             // 只在回到前台后的这段时间内才认为是「开屏期」并允许扫描。
             // 超过就停止，避免在正常界面（如抖音全屏搜索）里乱找按钮。
-            r.splashWindowMs = clamp(g.optInt("splashWindowMs", 6000), 1000, 60000);
+            // v3.4：默认 6000 -> 12000。
+            // 为什么必须延长：冷启动慢的手机上，App 自己的启动页 + 广告 SDK 加载素材
+            // 常常在 6 秒后才把广告显示出来。观察窗口一收，之后广告显示多久都没人管
+            // —— 用户看到的就是「卡在开屏广告上，进不去」。超级课程表 + 京东开屏广告
+            // 正是这种「启动慢 + 广告后到」的组合。
+            r.splashWindowMs = clamp(g.optInt("splashWindowMs", 12000), 1000, 60000);
             // 同一应用两次观察之间的冷却时间。防止「观察结束 -> 界面变化 -> 重新开观察」
             // 这个循环把扫描带进正常界面。
-            r.episodeCooldownMs = clamp(g.optInt("episodeCooldownMs", 60000), 1000, 600000);
+            // v3.4：默认 60000 -> 8000，并且「上一轮没命中」时完全不冷却
+            // （见 decideForeground 的 lastEpisodeHit 判断）。60 秒会让用户
+            // 「关掉再开一次想重试」也被挡住，表现为「开机那一下没跳成，之后再也不跳」。
+            r.episodeCooldownMs = clamp(g.optInt("episodeCooldownMs", 8000), 1000, 600000);
             // 点击前复核目标是否还在原位（防 dispatchGesture 异步导致点击穿透）。
             r.verifyBeforeTap = g.optBoolean("verifyBeforeTap", true);
             // 稳健模式下候选按钮的面积上限（占窗口比例）。跳过按钮都很小。
@@ -197,6 +205,20 @@ final class RuleStore {
             // 摇一摇广告的「跳过」常做成一整条（文字 + 倒计时）的宽条，
             // 面积会超过 safeMaxArea。已确认是广告页时给一个更宽的上限。
             r.adMaxArea = clampDouble(g.optDouble("adMaxArea", 0.25), r.safeMaxArea, 0.55);
+
+            // ----------------------------------------------------------
+            // v3.4 自救能力
+            // ----------------------------------------------------------
+            // 首屏切走收手：默认关（见字段注释：这条会误杀「启动页 -> 广告页」）。
+            r.firstScreenExit = g.optBoolean("firstScreenExit", false);
+            // 不安全候选的容忍次数：给广告布局稳定留时间，避免一轮就被劝退。
+            r.unsafeRejectLimit = clamp(g.optInt("unsafeRejectLimit", 3), 1, 20);
+            // 兜底返回键：专治「跳过按钮是图片、节点树里什么都没有」的死锁开屏广告。
+            r.backKeyFallback = g.optBoolean("backKeyFallback", true);
+            r.backKeyDelayMs = clamp(g.optInt("backKeyDelayMs", 3500), 800, 20000);
+            // 前台轮询间隔：这是「开机后事件流静默也不用怕」的根源（见字段注释）。
+            // 下限 150ms 兜住过于激进的配置，上限 3000ms 兜住完全失效的配置。
+            r.fgPollMs = clamp(g.optInt("fgPollMs", 700), 150, 3000);
         }
 
         r.skipTexts = toList(root.optJSONArray("skipTexts"));
@@ -277,9 +299,55 @@ final class RuleStore {
          */
         boolean safeMode = true;
         /** 开屏期时长（毫秒）：只在这段时间内才允许扫描点击。 */
-        int splashWindowMs = 6000;
+        int splashWindowMs = 12000;
         /** 同一应用两次观察之间的冷却（毫秒），防止把扫描带进正常界面。 */
-        int episodeCooldownMs = 60000;
+        int episodeCooldownMs = 8000;
+
+        // ---------------- v3.4 自救能力（专治「开机不生效」「卡在开屏进不去」） ----------------
+
+        /**
+         * 开屏页切走就收手（默认关）。
+         *
+         * v3.3 里这条是默认生效的，但它会把最需要救的场景判反：
+         * App 先显示自己的 logo 启动页，1~3 秒后广告 SDK 才把广告盖上来。
+         * 两屏文字差异极大 → 被当成「用户已经切走了」→ 立即结束观察 →
+         * 广告真正出现时已经没人管 —— 用户看到的就是「卡在启动页进不去」。
+         * 所以 v3.4 默认关闭，只有在关掉稳健模式、明确要求「尽快收手」时才打开。
+         */
+        boolean firstScreenExit = false;
+
+        /**
+         * 命中「不安全候选」多少次才放弃本轮（默认 3）。
+         *
+         * v3.3 是第一次遇到不安全候选就 endWatch —— 而广告刚渲染出来时
+         * 布局还没稳定、外面那层大概率是整屏容器，于是常常「一轮就被劝退」，
+         * 表现为偶发不跳。改成计数，给布局稳定留出时间。
+         */
+        int unsafeRejectLimit = 3;
+
+        /**
+         * 兜底按返回键（默认开）。
+         *
+         * 开屏广告常见「关不掉也跳不过」：跳过按钮是纯图片/视频覆盖层，
+         * 无障碍树里什么都没有，用户就卡在启动页上既进不去也退不出。
+         * 只要**已确认这是广告页**（页面上有「互动广告 / 摇一摇」这类措辞），
+         * 卡到 backKeyDelayMs 还没跳掉，就执行一次系统返回 —— 广告页返回
+         * 通常直接结束广告，等价于「跳过」。普通界面上绝不触发。
+         */
+        boolean backKeyFallback = true;
+        /** 判定「该按返回键」的等待时长：从本轮观察开始算。 */
+        int backKeyDelayMs = 3500;
+
+        /**
+         * 前台轮询间隔（默认 700ms）。
+         *
+         * v3.4 之前整套逻辑只靠无障碍事件驱动。开机后系统拉起服务的那一刻，
+         * 事件流常常是静默的（ROM 吞掉首批事件、或服务绑定的时机早于界面渲染），
+         * 于是服务在跑却一个事件都收不到 —— 界面照旧，永远不跳。
+         * 这条轮询直接读活动窗口包名，与事件无关，是「开机后不生效」的根治。
+         * 观察期内会自动缩短到一半（最快 220ms），以便更早发现开屏广告。
+         */
+        int fgPollMs = 700;
         /** 点击前复核目标仍在其原位置（防异步点击穿透）。 */
         boolean verifyBeforeTap = true;
         /** 稳健模式下允许的最大候选面积占比。 */
@@ -455,6 +523,15 @@ final class RuleStore {
             String lastEpisodePkg;
             /** 上一次观察结束的时刻（uptimeMillis）。 */
             long lastEpisodeEndMs;
+            /**
+             * 上一次观察**是否真的跳成功过**。
+             *
+             * v3.4 新增。没有这个标志时，冷却无法区分两种情况：
+             *   · 上一轮跳掉了 → 现在的界面变化是「广告页跳到主界面」，确实不该再扫；
+             *   · 上一轮压根没跳成（漏跳）→ 用户关掉再开一次想重试，却被冷却挡在门外。
+             * 后者正是「开机那一下没跳成，之后怎么开都不跳」的直接原因。
+             */
+            boolean lastEpisodeHit;
             /** 自上次观察结束后，是否出现过桌面/系统窗口（说明用户真的离开过该应用）。 */
             boolean sawSystemSinceEpisode;
             /** 当前时刻（uptimeMillis）。 */
@@ -515,9 +592,14 @@ final class RuleStore {
             // 刚从同一个应用观察完、且期间没回过桌面/系统窗口，
             // 说明这多半只是该应用内部的界面切换（例如从广告页跳到主页），
             // 不能再来一轮，否则就是在正常界面上乱找按钮。
+            //
+            // v3.4：只有「上一轮确实跳成功过」才认这个冷却。
+            // 上一轮没跳成（漏跳/超时/被拦下）时立刻重新开始观察 ——
+            // 那条路才是「用户关掉再开一次想重试」的真实场景，
+            // 拿冷却挡住它等于让漏跳变成永久漏跳。
             boolean sameAppAgain = pkg.equals(ctx.lastEpisodePkg);
             boolean withinCooldown = (ctx.now - ctx.lastEpisodeEndMs) < episodeCooldownMs;
-            if (sameAppAgain && withinCooldown && !ctx.sawSystemSinceEpisode) {
+            if (sameAppAgain && withinCooldown && !ctx.sawSystemSinceEpisode && ctx.lastEpisodeHit) {
                 return FG_IGNORE;
             }
 
